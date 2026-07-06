@@ -1,432 +1,3195 @@
-# ======================================================================================
-# Script: Citrix Production Analytics Dashboard - Component Block 1 of 3 (FIXED)
-# Minimum Version Support: Citrix Virtual Apps and Desktops (CVAD) 2203 LTSR, 2402 LTSR, 
-#                          2507 LTSR, and all subsequent modern Current Releases
-# Output Target: C:\Temp\Reports\ (please change to required location
-# Author M Mehta
-# HTML enhancements created with Google AI
-# ======================================================================================
+#==============================================================================#============================================================================ and CSV export
+# Output Target: C:\Temp\Reports\
+#
+# Output Columns:
+#   User, Delivery Group, Published Application, Published Desktop,
+#   VDA Host, CPU, MEM, Logon Time
+#
+# Design:
+#   - Metadata-driven Citrix Monitor OData discovery
+#   - CVAD version-agnostic where practical
+#   - No hard-coded Monitor database/schema table names
+#   - No per-session OData navigation calls
+#   - Broker SDK fallback for Delivery Group, machine kind, app and desktop entitlement
+#   - Published Application and Published Desktop resolved independently
+#   - Controlled desktop fallback to prevent app-only users inheriting desktops
+#   - HTML filter for last 1, 7, 30, 60 days, and all loaded data
+# Author: Miral Mehta
+# HTML Enhancements: Google AI
+#==============================================================================
 
-# 1. TIMEFRAME LOOKBACK CONFIGURATION CONFIG
-$LookbackDays = 60
-$PastDateUTC = [DateTime]::UtcNow.AddDays(-$LookbackDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+[CmdletBinding()]
+param(
+    [int]$LookbackDays = 60,
+    [string]$ControllerAddress = "localhost",
+    [string]$TargetDirectory = "C:\Temp\Reports",
+    [switch]$PreferHttp,
+    [switch]$EnableApplicationDiagnostics
+)
 
-# Configure Output file location
-$TargetDirectory = "C:\Temp\Reports" #Change the target loaction to one that is more suitable
+$ErrorActionPreference = "Stop"
+$script:LastODataUri = $null
+
+#------------------------------------------------------------------------------
+# Initialisation
+#------------------------------------------------------------------------------
+
 $ArchiveDirectory = Join-Path $TargetDirectory "Archive"
 
-# Ensure both target and archive paths exist cleanly on the filesystem disk
-if (-not (Test-Path $TargetDirectory)) { [void](New-Item -ItemType Directory -Path $TargetDirectory -Force) }
-if (-not (Test-Path $ArchiveDirectory)) { [void](New-Item -ItemType Directory -Path $ArchiveDirectory -Force) }
+foreach ($Directory in @($TargetDirectory, $ArchiveDirectory)) {
+    if (-not (Test-Path $Directory)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+}
 
-# Create a sortable date-time stamp variable token
 $TimestampToken = (Get-Date).ToString("yyyyMMdd_HHmmss")
-$OutputFile     = Join-Path $TargetDirectory "Citrix_60Day_Director_Dashboard_$TimestampToken.html"
 
-Write-Host "Connecting to Production Citrix Monitor OData API Streams..." -ForegroundColor Cyan
+$OutputHtmlFile = Join-Path $TargetDirectory "Citrix_Director_Historical_Dashboard_$TimestampToken.html"
+$OutputCsvFile  = Join-Path $TargetDirectory "Citrix_Director_Historical_Dashboard_$TimestampToken.csv"
+$LogFile        = Join-Path $TargetDirectory "Citrix_Dashboard_Compiler_$TimestampToken.log"
+
 try {
-    $UsersTable    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Users" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
-    $MachinesTable  = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Machines" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
-    $GroupsTable    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/DesktopGroups" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
-    $RawSessions    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Sessions?`$filter=StartDate ge $PastDateUTC" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
-    
-    # Fetch both standardized native performance summary repositories
-    Write-Host "Extracting production telemetry resource tables..." -ForegroundColor Cyan
-    $VdiMetrics     = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/ResourceUtilizationSummary" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
-    $ServerMetrics  = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/UserResourceUtilizationSummary" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
-} catch {
-    Write-Error "Failed to extract operational data from Citrix Monitor Service: $($_.Exception.Message)"
-    exit
+    Start-Transcript -Path $LogFile -Force | Out-Null
+}
+catch {
+    Write-Warning "Unable to start transcript logging. Continuing without transcript. $($_.Exception.Message)"
 }
 
-if (-not $RawSessions) { Write-Warning "No operational session records located inside lookup window."; exit }
+#------------------------------------------------------------------------------
+# Generic Helpers
+#------------------------------------------------------------------------------
 
-# Map core tables to high-performance local Hash Tables for rapid loop queries
-$UserLookup    = $UsersTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
-$MachineLookup = $MachinesTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
-$GroupLookup   = $GroupsTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
+function Write-Section {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
 
-# Build a mapping dictionary translating database machine identifiers to human-readable names
-$MachineIdToNameMap = @{}
-foreach ($Machine in $MachinesTable) {
-    if ($Machine.Id -ne $null -and $Machine.Name) { $MachineIdToNameMap[$Machine.Id] = $Machine.Name }
+    Write-Host ""
+    Write-Host "=============================================================================="
+    Write-Host $Message -ForegroundColor Cyan
+    Write-Host "=============================================================================="
 }
 
-# Build a mapping dictionary translating raw database user integer IDs straight to textual UserNames
-$UserKeyToNameMap = @{}
-foreach ($User in $UsersTable) {
-    if ($User.Id -ne $null -and $User.UserName) { 
-        $UserKeyToNameMap[$User.Id.ToString().Trim().ToLower()] = $User.UserName.ToString().Trim().ToLower() 
+function Test-Blank {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    return [System.String]::IsNullOrWhiteSpace([string]$Value)
+}
+
+function Import-CitrixBrokerSnapInIfAvailable {
+    try {
+        if (-not (Get-Command Get-BrokerController -ErrorAction SilentlyContinue)) {
+            Add-PSSnapin Citrix.Broker.Admin.V2 -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-Verbose "Citrix Broker snap-in could not be loaded automatically. $($_.Exception.Message)"
     }
 }
 
-# INDEX LAYER A: Production VDI Machine summaries indexed strictly by single Guid strings
-$HostMetricsLookup = @{}
-if ($VdiMetrics) {
-    $GroupedMetrics = $VdiMetrics | Where-Object { $_.MachineId -ne $null } | Group-Object MachineId
-    foreach ($Group in $GroupedMetrics) {
-        $CleanCpu = [System.Collections.Generic.List[double]]::new()
-        $CleanMem = [System.Collections.Generic.List[double]]::new()
-        
-        foreach ($MetricRow in $Group.Group) {
-            $ParsedCpu = 0.0; $ParsedMem = 0.0
-            if ($MetricRow.AvgPercentCpu -and [double]::TryParse($MetricRow.AvgPercentCpu, [ref]$ParsedCpu)) { $CleanCpu.Add($ParsedCpu) }
-            if ($MetricRow.AvgUsedMemory -and [double]::TryParse($MetricRow.AvgUsedMemory, [ref]$ParsedMem)) { $CleanMem.Add($ParsedMem) }
-        }
-        
-        $AvgCpuCalculated = if ($CleanCpu.Count -gt 0) { ($CleanCpu | Measure-Object -Average).Average } else { $null }
-        $AvgMemCalculated = if ($CleanMem.Count -gt 0) { ($CleanMem | Measure-Object -Average).Average } else { $null }
-        
-        # FIXED: Explicitly targeting the group's string identity property to ensure clean lookups
-        if ($Group.Name) {
-            $MachineStringGuidKey = $Group.Name.ToString().Trim().ToLower()
-            $HostMetricsLookup[$MachineStringGuidKey] = [PSCustomObject]@{
-                CpuList = $CleanCpu
-                MemList = $CleanMem
-                AvgCpu  = $AvgCpuCalculated
-                AvgMem  = $AvgMemCalculated
+function Convert-ToNormalisedReferenceString {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $Text = [string]$Value
+
+    if ([System.String]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    $Text = $Text.Trim()
+    $Text = $Text.Trim("{", "}")
+
+    if ([System.String]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    return $Text.ToLowerInvariant()
+}
+
+function Get-NormalisedReferenceValuesFromValue {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    $Results = [System.Collections.Generic.List[string]]::new()
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($Item in $Value) {
+            $Normalised = Convert-ToNormalisedReferenceString -Value $Item
+
+            if (-not [System.String]::IsNullOrWhiteSpace($Normalised)) {
+                [void]$Results.Add($Normalised)
             }
         }
     }
+    else {
+        $Normalised = Convert-ToNormalisedReferenceString -Value $Value
+
+        if (-not [System.String]::IsNullOrWhiteSpace($Normalised)) {
+            [void]$Results.Add($Normalised)
+        }
+    }
+
+    return @($Results | Sort-Object -Unique)
 }
 
-# Production Aligned: Maps metric rows cleanly by Username AND Session Type to prevent cross-contamination
-$UserPerfLookup = @{}
-if ($ServerMetrics) {
-    foreach ($Row in $ServerMetrics) {
-        $MetricUserKeyStr = $null
-        if ($Row.UserKey -ne $null) { $MetricUserKeyStr = $Row.UserKey.ToString().Trim().ToLower() }
-        elseif ($Row.UserId -ne $null) { $MetricUserKeyStr = $Row.UserId.ToString().Trim().ToLower() }
+function Add-MapListValue {
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$Map,
 
-        if ($MetricUserKeyStr -and $UserKeyToNameMap.ContainsKey($MetricUserKeyStr) -and $Row.SessionType -ne $null) {
-            $ResolvedTextName = $UserKeyToNameMap[$MetricUserKeyStr]
-            $CleanTypeToken = $Row.SessionType.ToString().Trim().ToLower()
-            
-            # Creates a precise key like "john.doe-1" or "john.doe-2"
-            $CompositeStringKey = "$ResolvedTextName-$CleanTypeToken"
-            
-            if (-not $UserPerfLookup.ContainsKey($CompositeStringKey)) {
-                $UserPerfLookup[$CompositeStringKey] = [System.Collections.Generic.List[PSCustomObject]]::new()
-            }
-            $UserPerfLookup[$CompositeStringKey].Add($Row)
-        }
+        [Parameter(Mandatory)]
+        [string]$Key,
+
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    if ([System.String]::IsNullOrWhiteSpace($Key) -or [System.String]::IsNullOrWhiteSpace($Value)) {
+        return
+    }
+
+    if (-not $Map.ContainsKey($Key)) {
+        $Map[$Key] = [System.Collections.Generic.List[string]]::new()
+    }
+
+    if (-not $Map[$Key].Contains($Value)) {
+        [void]$Map[$Key].Add($Value)
     }
 }
 
-$TempResolvedList = [System.Collections.Generic.List[PSCustomObject]]::new()
+function Get-ObjectPropertyValue {
+    param(
+        [Parameter(Mandatory)]
+        [object]$InputObject,
 
-    # PRODUCTION HYBRID ROUTING MATRIX (1912 Backward Compatible)
-    $FoundPerformanceMetrics = $false
-    $SessionMachineStringGuidKey = if ($Session.MachineId) { $Session.MachineId.ToString().Trim().ToLower() } else { "" }
-    
-    # Bypass unstable user tables and evaluate directly against the Machine Guid data table
-    if ($SessionMachineStringGuidKey -and $HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
-        $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
-        
-        if ($MetricsObject.CpuList.Count -gt 0) { 
-            $SessionCpu = "$([Math]::Round(($MetricsObject.CpuList | Measure-Object -Average).Average))%" 
-        }
-        if ($MetricsObject.MemList.Count -gt 0) { 
-            $CalculatedAvgMem = ($MetricsObject.MemList | Measure-Object -Average).Average
-            # Safely formats memory display whether treating raw bytes (VDI) or percentage load indicators (Multi-Session OS)
-            if ($CalculatedAvgMem -gt 100000) { 
-                $SessionMem = "{0:N0} MB" -f ($CalculatedAvgMem / 1MB) 
-            } else { 
-                $SessionMem = "$([Math]::Round($CalculatedAvgMem))% Load" 
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($PropertyName in $PropertyNames) {
+        if ($InputObject.PSObject.Properties.Name -contains $PropertyName) {
+            $Value = $InputObject.$PropertyName
+
+            if ($null -ne $Value -and -not (Test-Blank $Value)) {
+                return $Value
             }
         }
     }
 
-# ==============================================================================
-# Script: Citrix Production Analytics Dashboard - Component Block 2 of 3 
-# ==============================================================================
+    return $null
+}
 
-foreach ($Session in $RawSessions) {
-    $AccountUser = if ($Session.UserId -and $UserLookup.ContainsKey($Session.UserId)) { $UserLookup[$Session.UserId].UserName } else { "Unknown" }
-    
-    $VdaHost = "Unknown"; $MachineOS = ""; $DGName = "Unknown"; $RawGroupDeliveryType = $null
-    if ($Session.MachineId -and $MachineLookup.ContainsKey($Session.MachineId)) { 
-        $MatchedMachine = $MachineLookup[$Session.MachineId]
-        $VdaHost = $MatchedMachine.Name
-        $MachineOS = if ($MatchedMachine.OSType) { $MatchedMachine.OSType } else { $MatchedMachine.OperatingSystem }
-        
-        $MachineGroupId = if ($MatchedMachine.DesktopGroupId) { $MatchedMachine.DesktopGroupId } else { $MatchedMachine.DesktopGroupKey }
-        if ($MachineGroupId -and $GroupLookup.ContainsKey($MachineGroupId)) {
-            $DGName = if ($GroupLookup[$MachineGroupId].GroupName) { $GroupLookup[$MachineGroupId].GroupName } else { $GroupLookup[$MachineGroupId].Name }
-            $RawGroupDeliveryType = $GroupLookup[$MachineGroupId].DeliveryType
+function Get-RowReferenceValues {
+    param(
+        [Parameter(Mandatory)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$CandidateProperties
+    )
+
+    $Values = [System.Collections.Generic.List[string]]::new()
+
+    if ($null -eq $InputObject) {
+        return @()
+    }
+
+    foreach ($PropertyName in $CandidateProperties) {
+        if ($InputObject.PSObject.Properties.Name -contains $PropertyName) {
+            foreach ($Value in (Get-NormalisedReferenceValuesFromValue -Value $InputObject.$PropertyName)) {
+                [void]$Values.Add($Value)
+            }
         }
     }
 
-    # Connection State Resolver
-    if ($Session.EndDate) { $LifecycleStr = "Ended" } 
-    elseif ($Session.ConnectionState -eq 5 -or $Session.ConnectionState -eq "Connected" -or $Session.SessionState -eq 1 -or $Session.SessionState -match "Active|Logon") { 
-        $LifecycleStr = "Active" 
-    } else { 
-        $LifecycleStr = "Disconnected" 
+    return @($Values | Sort-Object -Unique)
+}
+
+function Convert-ToNullableDateTime {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
     }
 
-    $SessionDetails = ""; $SessionCpu = "No Data"; $SessionMem = "No Data"
-    
-    # Fetch active application instances safely using core session routing handles
-    $ActiveSessionKey = if ($Session.SessionKey) { $Session.SessionKey } else { $Session.Id }
-    if ($ActiveSessionKey) {
+    try {
+        return [DateTime]$Value
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-FirstDatePropertyValue {
+    param(
+        [Parameter(Mandatory)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$PropertyNames
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($PropertyName in $PropertyNames) {
+        if ($InputObject.PSObject.Properties.Name -contains $PropertyName) {
+            $DateValue = Convert-ToNullableDateTime -Value $InputObject.$PropertyName
+
+            if ($null -ne $DateValue) {
+                return $DateValue
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-ShortMachineName {
+    param(
+        [AllowNull()]
+        [object]$MachineName
+    )
+
+    if ($null -eq $MachineName) {
+        return ""
+    }
+
+    $RawName = [string]$MachineName
+
+    if ([System.String]::IsNullOrWhiteSpace($RawName)) {
+        return ""
+    }
+
+    $Parts = $RawName -split '\\'
+    return ([string]$Parts[-1]).Trim().ToLowerInvariant()
+}
+
+function Format-CpuMetric {
+    param(
+        [Nullable[double]]$Value
+    )
+
+    if ($null -eq $Value -or $Value -lt 0) {
+        return "No Data"
+    }
+
+    return "$([System.Math]::Round($Value, 0))%"
+}
+
+function Format-MemoryMetric {
+    param(
+        [Nullable[double]]$Value,
+
+        [AllowNull()]
+        [string]$SourceProperty
+    )
+
+    if ($null -eq $Value -or $Value -le 0) {
+        return "No Data"
+    }
+
+    if ($SourceProperty -and $SourceProperty -match 'Percent|Percentage|Util|Load') {
+        return "$([System.Math]::Round($Value, 0))% Load"
+    }
+
+    if ($Value -gt 131072) {
+        return "{0:N0} MB" -f ($Value / 1MB)
+    }
+
+    return "{0:N0} MB" -f $Value
+}
+
+function Test-IsDesktopSession {
+    param(
+        [AllowNull()]
+        [object]$SessionTypeValue
+    )
+
+    if ($null -eq $SessionTypeValue) {
+        return $false
+    }
+
+    $SessionTypeText = ([string]$SessionTypeValue).Trim()
+
+    switch -Regex ($SessionTypeText) {
+        '^(1)$'               { return $true }
+        'Desktop'             { return $true }
+        'PublishedDesktop'    { return $true }
+        'HostedSharedDesktop' { return $true }
+        'VDI'                 { return $true }
+        default               { return $false }
+    }
+}
+
+function Test-IsApplicationSession {
+    param(
+        [AllowNull()]
+        [object]$SessionTypeValue
+    )
+
+    if ($null -eq $SessionTypeValue) {
+        return $false
+    }
+
+    $SessionTypeText = ([string]$SessionTypeValue).Trim()
+
+    switch -Regex ($SessionTypeText) {
+        '^(2)$'                { return $true }
+        'Application'          { return $true }
+        'PublishedApplication' { return $true }
+        'App'                  { return $true }
+        default                { return $false }
+    }
+}
+
+function Get-SessionCandidateReferenceValues {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Session
+    )
+
+    $CandidateProperties = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($PropertyName in @(
+        "Id",
+        "Key",
+        "Uid",
+        "UId",
+        "Guid",
+        "UUID",
+        "SessionId",
+        "SessionKey",
+        "SessionUid",
+        "SessionUId",
+        "SessionGuid",
+        "SessionUUID",
+        "ConnectionId",
+        "ConnectionKey",
+        "ConnectionUid",
+        "ConnectionUId",
+        "ConnectionGuid",
+        "ConnectionUUID",
+        "LogOnId",
+        "LogonId",
+        "LogOnKey",
+        "LogonKey"
+    )) {
+        [void]$CandidateProperties.Add($PropertyName)
+    }
+
+    foreach ($Property in $Session.PSObject.Properties) {
+        if ($Property.Name -match 'Session|Connection|Logon|LogOn|Key|Uid|UId|Guid|UUID|^Id$') {
+            [void]$CandidateProperties.Add($Property.Name)
+        }
+    }
+
+    return Get-RowReferenceValues `
+        -InputObject $Session `
+        -CandidateProperties @($CandidateProperties | Sort-Object -Unique)
+}
+
+function Get-SessionTimeWindowMatchScore {
+    param(
+        [Parameter(Mandatory)]
+        [DateTime]$SessionStart,
+
+        [Parameter(Mandatory)]
+        [DateTime]$EvidenceTime
+    )
+
+    $MinutesDifference = [System.Math]::Abs(
+        ($SessionStart.ToUniversalTime() - $EvidenceTime.ToUniversalTime()).TotalMinutes
+    )
+
+    if ($MinutesDifference -le 2)  { return 100 }
+    if ($MinutesDifference -le 5)  { return 80 }
+    if ($MinutesDifference -le 15) { return 60 }
+    if ($MinutesDifference -le 60) { return 30 }
+
+    return 0
+}
+
+function Test-MachineLooksLikeDesktop {
+    param(
+        [AllowNull()]
+        [string]$CleanMachineName,
+
+        [AllowNull()]
+        [string]$MachineKindText
+    )
+
+    if (-not (Test-Blank $MachineKindText)) {
+        if ($MachineKindText -match 'Desktop|VDI|SingleSession|Single-session|Private|Assigned') {
+            return $true
+        }
+
+        if ($MachineKindText -match 'Server|MultiSession|Multi-session|Shared|App') {
+            return $false
+        }
+    }
+
+    if ($CleanMachineName -and $CleanMachineName -match 'vdi|win10|win11|desktop') {
+        return $true
+    }
+
+    return $false
+}
+
+#------------------------------------------------------------------------------
+# Broker SDK Fallback Helpers
+#------------------------------------------------------------------------------
+
+function Invoke-BrokerCommandSafely {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName
+    )
+
+    if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
+        return @()
+    }
+
+    try {
+        return @(& $CommandName -MaxRecordCount 100000 -ErrorAction Stop)
+    }
+    catch {
         try {
-            $AppResponse = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Sessions($ActiveSessionKey)/ApplicationsInUse" -UseDefaultCredentials -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue).value
-            if ($AppResponse) { $SessionDetails = "App(s): " + (($AppResponse | ForEach-Object { if ($_.ApplicationName) { $_.ApplicationName } else { $_.Name } }) -join ", ") }
-        } catch {}
+            return @(& $CommandName -ErrorAction Stop)
+        }
+        catch {
+            Write-Warning "Unable to run $CommandName. $($_.Exception.Message)"
+            return @()
+        }
+    }
+}
+
+function Get-BrokerInventoryFallbackMaps {
+    [CmdletBinding()]
+    param()
+
+    $Maps = [PSCustomObject]@{
+        GroupNameByUid              = @{}
+        GroupUidByName              = @{}
+        MachineGroupNameByCleanName = @{}
+        MachineGroupUidByCleanName  = @{}
+        MachineKindByCleanName      = @{}
+        AppsByGroupUid              = @{}
+        AppsByGroupName             = @{}
+        AppsByUserName              = @{}
+        DesktopsByUserName          = @{}
+        DesktopsByGroupUid          = @{}
+        DesktopsByGroupName         = @{}
     }
 
-    # Workload Classification Map Logic Tree Override
-    $BrokerContext = ""
-    if ($Session.LaunchReference) { $BrokerContext += $Session.LaunchReference }
-    if ($Session.SessionName) { $BrokerContext += $Session.SessionName }
-    if ($Session.BrowserName) { $BrokerContext += $Session.BrowserName }
+    Import-CitrixBrokerSnapInIfAvailable
 
-    $NumericSessionTypeTag = "1" 
-    
-    if ($MachineOS -match "Windows 10|Windows 11|Windows 7|Windows 8") { 
-        $SessionDetails = "Desktop Session" 
-    } else {
-        if ($Session.IsSharedDesktop -eq $true -or $Session.IsSharedDesktop -eq "True" -or $BrokerContext -like "*Desktop*" -or $BrokerContext -like "*DESC*") {
-            $SessionDetails = "Shared Desktop Session"
-            $NumericSessionTypeTag = "1"
-        } 
-        elseif ($RawGroupDeliveryType -eq 2 -or $RawGroupDeliveryType -eq "AppsOnly" -or ($DGName -like "*App*" -and $DGName -notlike "*Desktop*")) {
-            if ($AccountUser -like "*Batman*" -and ($Session.SessionKey -match "1" -or $Session.SessionType -eq 1 -or $Session.SessionName -notlike "*Notepad*")) {
-                $SessionDetails = "Shared Desktop Session"
-                $NumericSessionTypeTag = "1"
-            } else {
-                if ($SessionDetails -eq "") { $SessionDetails = "Published Application" }
-                $NumericSessionTypeTag = "2" 
+    if (-not (Get-Command Get-BrokerMachine -ErrorAction SilentlyContinue)) {
+        Write-Warning "Citrix Broker SDK is not available. Broker fallback maps cannot be built."
+        return $Maps
+    }
+
+    $BrokerDesktopGroups = Invoke-BrokerCommandSafely -CommandName "Get-BrokerDesktopGroup"
+
+    foreach ($DesktopGroup in $BrokerDesktopGroups) {
+        $GroupName = Get-ObjectPropertyValue `
+            -InputObject $DesktopGroup `
+            -PropertyNames @("Name", "DesktopGroupName", "DeliveryGroupName", "PublishedName")
+
+        $GroupUid = Get-ObjectPropertyValue `
+            -InputObject $DesktopGroup `
+            -PropertyNames @("Uid", "UId", "Id", "DesktopGroupUid", "DesktopGroupUId", "DesktopGroupId")
+
+        $GroupUidKey = Convert-ToNormalisedReferenceString -Value $GroupUid
+
+        if ($GroupName -and $GroupUidKey) {
+            $Maps.GroupNameByUid[$GroupUidKey] = [string]$GroupName
+            $Maps.GroupUidByName[[string]$GroupName] = $GroupUidKey
+        }
+    }
+
+    $BrokerMachines = Invoke-BrokerCommandSafely -CommandName "Get-BrokerMachine"
+
+    foreach ($Machine in $BrokerMachines) {
+        $MachineNames = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($NameProperty in @("MachineName", "DNSName", "DnsName", "HostedMachineName", "AgentName", "Name")) {
+            if ($Machine.PSObject.Properties.Name -contains $NameProperty -and $Machine.$NameProperty) {
+                $CleanName = Get-ShortMachineName -MachineName $Machine.$NameProperty
+
+                if (-not [System.String]::IsNullOrWhiteSpace($CleanName)) {
+                    [void]$MachineNames.Add($CleanName)
+                }
             }
+        }
+
+        $MachineNames = @($MachineNames | Sort-Object -Unique)
+
+        if ($MachineNames.Count -eq 0) {
+            continue
+        }
+
+        $GroupName = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @("DesktopGroupName", "DeliveryGroupName", "GroupName")
+
+        $GroupUid = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @(
+                "DesktopGroupUid",
+                "DesktopGroupUId",
+                "DesktopGroupId",
+                "DeliveryGroupId",
+                "DeliveryGroupUid",
+                "GroupId",
+                "GroupUid"
+            )
+
+        $GroupUidKey = Convert-ToNormalisedReferenceString -Value $GroupUid
+
+        if ((-not $GroupName) -and $GroupUidKey -and $Maps.GroupNameByUid.ContainsKey($GroupUidKey)) {
+            $GroupName = $Maps.GroupNameByUid[$GroupUidKey]
+        }
+
+        $MachineKind = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @(
+                "SessionSupport",
+                "DesktopKind",
+                "AllocationType",
+                "MachineRole",
+                "MachineType",
+                "OSType",
+                "OSName",
+                "OperatingSystem"
+            )
+
+        foreach ($CleanName in $MachineNames) {
+            if ($GroupName) {
+                $Maps.MachineGroupNameByCleanName[$CleanName] = [string]$GroupName
+            }
+
+            if ($GroupUidKey) {
+                $Maps.MachineGroupUidByCleanName[$CleanName] = $GroupUidKey
+            }
+
+            if ($MachineKind) {
+                $Maps.MachineKindByCleanName[$CleanName] = [string]$MachineKind
+            }
+        }
+    }
+
+    $BrokerApplications = Invoke-BrokerCommandSafely -CommandName "Get-BrokerApplication"
+
+    foreach ($Application in $BrokerApplications) {
+        $ApplicationName = Get-ObjectPropertyValue `
+            -InputObject $Application `
+            -PropertyNames @("PublishedName", "ApplicationName", "Name", "BrowserName", "DisplayName")
+
+        if (-not $ApplicationName) {
+            continue
+        }
+
+        $ApplicationName = [string]$ApplicationName
+
+        $AssociatedGroupValues = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($GroupProperty in @(
+            "AssociatedDesktopGroupUids",
+            "AssociatedDesktopGroupIds",
+            "DesktopGroupUids",
+            "DesktopGroupIds",
+            "DesktopGroupUid",
+            "DesktopGroupUId",
+            "DesktopGroupId",
+            "DeliveryGroupUid",
+            "DeliveryGroupId",
+            "GroupUid",
+            "GroupId"
+        )) {
+            if ($Application.PSObject.Properties.Name -contains $GroupProperty) {
+                foreach ($Value in (Get-NormalisedReferenceValuesFromValue -Value $Application.$GroupProperty)) {
+                    [void]$AssociatedGroupValues.Add($Value)
+                }
+            }
+        }
+
+        $AssociatedGroupValues = @($AssociatedGroupValues | Sort-Object -Unique)
+
+        foreach ($GroupUidKey in $AssociatedGroupValues) {
+            Add-MapListValue -Map $Maps.AppsByGroupUid -Key $GroupUidKey -Value $ApplicationName
+
+            if ($Maps.GroupNameByUid.ContainsKey($GroupUidKey)) {
+                $GroupName = $Maps.GroupNameByUid[$GroupUidKey]
+                Add-MapListValue -Map $Maps.AppsByGroupName -Key $GroupName -Value $ApplicationName
+            }
+        }
+
+        $AssociatedUserValues = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($UserProperty in @(
+            "AssociatedUserNames",
+            "AssociatedUsers",
+            "UserNames",
+            "Users",
+            "IncludedUsers",
+            "IncludedUserNames",
+            "AccountNames",
+            "Accounts",
+            "AllowedUsers",
+            "AllowedUserNames"
+        )) {
+            if ($Application.PSObject.Properties.Name -contains $UserProperty) {
+                foreach ($Value in (Get-NormalisedReferenceValuesFromValue -Value $Application.$UserProperty)) {
+                    [void]$AssociatedUserValues.Add($Value)
+                }
+            }
+        }
+
+        $AssociatedUserValues = @($AssociatedUserValues | Sort-Object -Unique)
+
+        foreach ($UserKey in $AssociatedUserValues) {
+            Add-MapListValue -Map $Maps.AppsByUserName -Key $UserKey -Value $ApplicationName
+        }
+    }
+
+    $BrokerEntitlementRules = Invoke-BrokerCommandSafely -CommandName "Get-BrokerEntitlementPolicyRule"
+
+    foreach ($Rule in $BrokerEntitlementRules) {
+        $RuleEnabled = Get-ObjectPropertyValue `
+            -InputObject $Rule `
+            -PropertyNames @("Enabled")
+
+        if ($null -ne $RuleEnabled -and [string]$RuleEnabled -match 'False') {
+            continue
+        }
+
+        $DesktopName = Get-ObjectPropertyValue `
+            -InputObject $Rule `
+            -PropertyNames @("PublishedName", "DesktopName", "Name", "IncludedDesktopName", "EntitlementName")
+
+        $GroupUid = Get-ObjectPropertyValue `
+            -InputObject $Rule `
+            -PropertyNames @(
+                "DesktopGroupUid",
+                "DesktopGroupUId",
+                "DesktopGroupId",
+                "DeliveryGroupUid",
+                "DeliveryGroupId",
+                "GroupUid",
+                "GroupId"
+            )
+
+        $GroupUidKey = Convert-ToNormalisedReferenceString -Value $GroupUid
+
+        if (-not $DesktopName -and $GroupUidKey -and $Maps.GroupNameByUid.ContainsKey($GroupUidKey)) {
+            $DesktopName = $Maps.GroupNameByUid[$GroupUidKey]
+        }
+
+        if (-not $DesktopName) {
+            continue
+        }
+
+        $DesktopName = [string]$DesktopName
+
+        if ($GroupUidKey) {
+            Add-MapListValue -Map $Maps.DesktopsByGroupUid -Key $GroupUidKey -Value $DesktopName
+
+            if ($Maps.GroupNameByUid.ContainsKey($GroupUidKey)) {
+                $GroupName = $Maps.GroupNameByUid[$GroupUidKey]
+                Add-MapListValue -Map $Maps.DesktopsByGroupName -Key $GroupName -Value $DesktopName
+            }
+        }
+
+        $IncludedUserValues = [System.Collections.Generic.List[string]]::new()
+
+        foreach ($UserProperty in @(
+            "IncludedUsers",
+            "IncludedUserNames",
+            "AllowedUsers",
+            "AllowedUserNames",
+            "AssociatedUsers",
+            "AssociatedUserNames",
+            "UserNames",
+            "Users",
+            "Accounts",
+            "AccountNames"
+        )) {
+            if ($Rule.PSObject.Properties.Name -contains $UserProperty) {
+                foreach ($Value in (Get-NormalisedReferenceValuesFromValue -Value $Rule.$UserProperty)) {
+                    [void]$IncludedUserValues.Add($Value)
+                }
+            }
+        }
+
+        $IncludedUserValues = @($IncludedUserValues | Sort-Object -Unique)
+
+        foreach ($UserKey in $IncludedUserValues) {
+            Add-MapListValue -Map $Maps.DesktopsByUserName -Key $UserKey -Value $DesktopName
+        }
+    }
+
+    Write-Host "Broker fallback group entries         : $($Maps.GroupNameByUid.Count)" -ForegroundColor DarkCyan
+    Write-Host "Broker fallback machine group entries : $($Maps.MachineGroupNameByCleanName.Count)" -ForegroundColor DarkCyan
+    Write-Host "Broker fallback app group entries     : $($Maps.AppsByGroupUid.Count)" -ForegroundColor DarkCyan
+    Write-Host "Broker fallback user app entries      : $($Maps.AppsByUserName.Count)" -ForegroundColor DarkCyan
+    Write-Host "Broker fallback user desktop entries  : $($Maps.DesktopsByUserName.Count)" -ForegroundColor DarkCyan
+    Write-Host "Broker fallback group desktop entries : $($Maps.DesktopsByGroupUid.Count)" -ForegroundColor DarkCyan
+
+    return $Maps
+}
+
+function Resolve-ApplicationFromBrokerUserFallback {
+    param(
+        [AllowNull()]
+        [string]$SessionUserName,
+
+        [AllowNull()]
+        [string]$SessionUserRef,
+
+        [Parameter(Mandatory)]
+        [object]$BrokerFallbackMaps
+    )
+
+    $CandidateApps = [System.Collections.Generic.List[string]]::new()
+
+    $NormalisedSessionUserName = Convert-ToNormalisedReferenceString -Value $SessionUserName
+    $NormalisedSessionUserRef  = Convert-ToNormalisedReferenceString -Value $SessionUserRef
+
+    if ($BrokerFallbackMaps.PSObject.Properties.Name -contains "AppsByUserName") {
+        if ($NormalisedSessionUserName -and $BrokerFallbackMaps.AppsByUserName.ContainsKey($NormalisedSessionUserName)) {
+            foreach ($App in $BrokerFallbackMaps.AppsByUserName[$NormalisedSessionUserName]) {
+                [void]$CandidateApps.Add([string]$App)
+            }
+        }
+
+        if ($NormalisedSessionUserRef -and $BrokerFallbackMaps.AppsByUserName.ContainsKey($NormalisedSessionUserRef)) {
+            foreach ($App in $BrokerFallbackMaps.AppsByUserName[$NormalisedSessionUserRef]) {
+                [void]$CandidateApps.Add([string]$App)
+            }
+        }
+    }
+
+    $DistinctApps = @($CandidateApps | Sort-Object -Unique)
+
+    if ($DistinctApps.Count -eq 1) {
+        return $DistinctApps[0]
+    }
+
+    return $null
+}
+
+function Resolve-DesktopFromBrokerUserFallback {
+    param(
+        [AllowNull()]
+        [string]$SessionUserName,
+
+        [AllowNull()]
+        [string]$SessionUserRef,
+
+        [Parameter(Mandatory)]
+        [object]$BrokerFallbackMaps
+    )
+
+    $CandidateDesktops = [System.Collections.Generic.List[string]]::new()
+
+    $NormalisedSessionUserName = Convert-ToNormalisedReferenceString -Value $SessionUserName
+    $NormalisedSessionUserRef  = Convert-ToNormalisedReferenceString -Value $SessionUserRef
+
+    if ($BrokerFallbackMaps.PSObject.Properties.Name -contains "DesktopsByUserName") {
+        if ($NormalisedSessionUserName -and $BrokerFallbackMaps.DesktopsByUserName.ContainsKey($NormalisedSessionUserName)) {
+            foreach ($Desktop in $BrokerFallbackMaps.DesktopsByUserName[$NormalisedSessionUserName]) {
+                [void]$CandidateDesktops.Add([string]$Desktop)
+            }
+        }
+
+        if ($NormalisedSessionUserRef -and $BrokerFallbackMaps.DesktopsByUserName.ContainsKey($NormalisedSessionUserRef)) {
+            foreach ($Desktop in $BrokerFallbackMaps.DesktopsByUserName[$NormalisedSessionUserRef]) {
+                [void]$CandidateDesktops.Add([string]$Desktop)
+            }
+        }
+    }
+
+    $DistinctDesktops = @($CandidateDesktops | Sort-Object -Unique)
+
+    if ($DistinctDesktops.Count -eq 1) {
+        return $DistinctDesktops[0]
+    }
+
+    return $null
+}
+
+function Test-IsClearlyAppOnlyUser {
+    param(
+        [AllowNull()]
+        [string]$SessionUserName,
+
+        [AllowNull()]
+        [string]$SessionUserRef,
+
+        [Parameter(Mandatory)]
+        [object]$BrokerFallbackMaps
+    )
+
+    $NormalisedSessionUserName = Convert-ToNormalisedReferenceString -Value $SessionUserName
+    $NormalisedSessionUserRef  = Convert-ToNormalisedReferenceString -Value $SessionUserRef
+
+    $HasUserApp = $false
+    $HasUserDesktop = $false
+
+    foreach ($UserKey in @($NormalisedSessionUserName, $NormalisedSessionUserRef)) {
+        if ([System.String]::IsNullOrWhiteSpace($UserKey)) {
+            continue
+        }
+
+        if ($BrokerFallbackMaps.AppsByUserName.ContainsKey($UserKey)) {
+            if ($BrokerFallbackMaps.AppsByUserName[$UserKey].Count -gt 0) {
+                $HasUserApp = $true
+            }
+        }
+
+        if ($BrokerFallbackMaps.DesktopsByUserName.ContainsKey($UserKey)) {
+            if ($BrokerFallbackMaps.DesktopsByUserName[$UserKey].Count -gt 0) {
+                $HasUserDesktop = $true
+            }
+        }
+    }
+
+    return ($HasUserApp -and -not $HasUserDesktop)
+}
+
+#------------------------------------------------------------------------------
+# OData Helpers
+#------------------------------------------------------------------------------
+
+function Resolve-ODataNextLink {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$CurrentUri,
+
+        [Parameter(Mandatory)]
+        [string]$NextLink
+    )
+
+    if (Test-Blank $NextLink) {
+        return $null
+    }
+
+    $NextLink = $NextLink.Trim()
+
+    if ($NextLink -match '^https?://') {
+        return $NextLink
+    }
+
+    $CurrentUriObject = [System.Uri]::new($CurrentUri)
+
+    $CurrentBaseWithoutQuery = '{0}://{1}{2}' -f `
+        $CurrentUriObject.Scheme,
+        $CurrentUriObject.Authority,
+        $CurrentUriObject.AbsolutePath
+
+    if ($NextLink.StartsWith("/")) {
+        return '{0}://{1}{2}' -f `
+            $CurrentUriObject.Scheme,
+            $CurrentUriObject.Authority,
+            $NextLink
+    }
+
+    if ($NextLink.StartsWith("?")) {
+        return '{0}{1}' -f $CurrentBaseWithoutQuery, $NextLink
+    }
+
+    if ($NextLink.StartsWith('$')) {
+        return '{0}?{1}' -f $CurrentBaseWithoutQuery, $NextLink
+    }
+
+    $ResolvedUri = [System.Uri]::new($CurrentUriObject, $NextLink)
+    return $ResolvedUri.AbsoluteUri
+}
+
+function Test-AbsoluteHttpUri {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    if (Test-Blank $Uri) {
+        return $false
+    }
+
+    $ParsedUri = $null
+
+    if (-not [System.Uri]::TryCreate($Uri, [System.UriKind]::Absolute, [ref]$ParsedUri)) {
+        return $false
+    }
+
+    return ($ParsedUri.Scheme -eq "http" -or $ParsedUri.Scheme -eq "https")
+}
+
+function Test-ODataEndpoint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl
+    )
+
+    try {
+        $MetadataUri = "$BaseUrl/`$metadata"
+
+        Invoke-WebRequest `
+            -Uri $MetadataUri `
+            -UseDefaultCredentials `
+            -UseBasicParsing `
+            -Method Get `
+            -TimeoutSec 30 `
+            -ErrorAction Stop | Out-Null
+
+        return $true
+    }
+    catch {
+        Write-Verbose "Endpoint test failed for '$BaseUrl'. $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Resolve-ControllerAddress {
+    param(
+        [Parameter(Mandatory)]
+        [string]$InputControllerAddress
+    )
+
+    if ($InputControllerAddress -ne "localhost") {
+        return $InputControllerAddress
+    }
+
+    Import-CitrixBrokerSnapInIfAvailable
+
+    try {
+        $ResolvedController = Get-BrokerController -ErrorAction Stop |
+            Select-Object -First 1 -ExpandProperty DNSName
+
+        if (-not (Test-Blank $ResolvedController)) {
+            return $ResolvedController
+        }
+    }
+    catch {
+        Write-Warning "Could not auto-resolve a Citrix Delivery Controller. Falling back to localhost. $($_.Exception.Message)"
+    }
+
+    return $InputControllerAddress
+}
+
+function Resolve-MonitorODataBaseUrl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ControllerAddress,
+
+        [switch]$PreferHttp
+    )
+
+    if ($PreferHttp) {
+        $CandidateBaseUrls = @(
+            "http://$ControllerAddress/Citrix/Monitor/OData/v4/Data",
+            "https://$ControllerAddress/Citrix/Monitor/OData/v4/Data"
+        )
+    }
+    else {
+        $CandidateBaseUrls = @(
+            "https://$ControllerAddress/Citrix/Monitor/OData/v4/Data",
+            "http://$ControllerAddress/Citrix/Monitor/OData/v4/Data"
+        )
+    }
+
+    foreach ($CandidateBaseUrl in $CandidateBaseUrls) {
+        Write-Host "Testing Monitor OData endpoint: $CandidateBaseUrl" -ForegroundColor DarkCyan
+
+        if (Test-ODataEndpoint -BaseUrl $CandidateBaseUrl) {
+            Write-Host "Using Monitor OData endpoint: $CandidateBaseUrl" -ForegroundColor Green
+            return $CandidateBaseUrl
+        }
+    }
+
+    throw "Unable to locate a reachable Citrix Monitor OData v4 endpoint on controller '$ControllerAddress'."
+}
+
+function New-ODataEntityUri {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl,
+
+        [Parameter(Mandatory)]
+        [string]$EntitySetName,
+
+        [string]$Filter
+    )
+
+    if (Test-Blank $BaseUrl) {
+        throw "BaseUrl is empty before building OData URI."
+    }
+
+    if (Test-Blank $EntitySetName) {
+        throw "EntitySetName is empty before building OData URI."
+    }
+
+    $RootUri = "{0}/{1}" -f $BaseUrl.TrimEnd('/'), $EntitySetName.TrimStart('/')
+
+    if (-not (Test-Blank $Filter)) {
+        $EncodedFilter = [System.Uri]::EscapeDataString($Filter)
+        $FinalUri = '{0}?$filter={1}' -f $RootUri, $EncodedFilter
+    }
+    else {
+        $FinalUri = $RootUri
+    }
+
+    if (-not (Test-AbsoluteHttpUri -Uri $FinalUri)) {
+        throw "Invalid OData URI constructed: '$FinalUri'"
+    }
+
+    return $FinalUri
+}
+
+function Invoke-ODataPagedQuery {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [int]$TimeoutSec = 120
+    )
+
+    if (-not (Test-AbsoluteHttpUri -Uri $Uri)) {
+        throw "Initial OData URI is not a valid absolute HTTP/HTTPS URI: '$Uri'"
+    }
+
+    $Results = [System.Collections.Generic.List[object]]::new()
+    $NextUri = $Uri
+    $PageNumber = 0
+
+    while ($NextUri) {
+        $PageNumber++
+
+        if (-not (Test-AbsoluteHttpUri -Uri $NextUri)) {
+            throw "Paged OData URI is not a valid absolute HTTP/HTTPS URI: '$NextUri'"
+        }
+
+        $script:LastODataUri = $NextUri
+        Write-Verbose "Querying OData page $PageNumber`: $NextUri"
+
+        $Response = Invoke-RestMethod `
+            -Uri $NextUri `
+            -UseDefaultCredentials `
+            -Method Get `
+            -TimeoutSec $TimeoutSec `
+            -ErrorAction Stop
+
+        if ($null -ne $Response.value) {
+            foreach ($Item in $Response.value) {
+                [void]$Results.Add($Item)
+            }
+        }
+
+        $NextUri = $null
+
+        $NextLinkProperty = $Response.PSObject.Properties |
+            Where-Object { $_.Name -match 'nextLink$' } |
+            Select-Object -First 1
+
+        if ($NextLinkProperty -and $NextLinkProperty.Value) {
+            $NextUri = Resolve-ODataNextLink `
+                -CurrentUri $script:LastODataUri `
+                -NextLink ([string]$NextLinkProperty.Value)
+        }
+    }
+
+    return $Results
+}
+
+function Get-ODataMetadataDocument {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl
+    )
+
+    $MetadataUri = "$BaseUrl/`$metadata"
+
+    try {
+        $Response = Invoke-WebRequest `
+            -Uri $MetadataUri `
+            -UseDefaultCredentials `
+            -UseBasicParsing `
+            -Method Get `
+            -TimeoutSec 60 `
+            -ErrorAction Stop
+
+        [xml]$MetadataXml = $Response.Content
+        return $MetadataXml
+    }
+    catch {
+        throw "Unable to retrieve OData metadata from '$MetadataUri'. $($_.Exception.Message)"
+    }
+}
+
+function Get-ODataEntitySetCatalogue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [xml]$Metadata
+    )
+
+    $Catalogue = [System.Collections.Generic.List[object]]::new()
+    $EntityTypeMap = @{}
+
+    $SchemaNodes = $Metadata.SelectNodes("//*[local-name()='Schema']")
+
+    foreach ($Schema in $SchemaNodes) {
+        $Namespace = [string]$Schema.Namespace
+        $EntityTypeNodes = $Schema.SelectNodes("./*[local-name()='EntityType']")
+
+        foreach ($EntityType in $EntityTypeNodes) {
+            $TypeName = [string]$EntityType.Name
+            $FullTypeName = "$Namespace.$TypeName"
+
+            $PropertyNames = @(
+                $EntityType.SelectNodes("./*[local-name()='Property']") |
+                    ForEach-Object { [string]$_.Name }
+            )
+
+            $NavigationPropertyNames = @(
+                $EntityType.SelectNodes("./*[local-name()='NavigationProperty']") |
+                    ForEach-Object { [string]$_.Name }
+            )
+
+            $EntityTypeMap[$FullTypeName] = [PSCustomObject]@{
+                Name                 = $TypeName
+                FullName             = $FullTypeName
+                Properties           = $PropertyNames
+                NavigationProperties = $NavigationPropertyNames
+            }
+        }
+    }
+
+    $EntitySetNodes = $Metadata.SelectNodes("//*[local-name()='EntityContainer']/*[local-name()='EntitySet']")
+
+    foreach ($EntitySet in $EntitySetNodes) {
+        $EntitySetName = [string]$EntitySet.Name
+        $EntityTypeRef = [string]$EntitySet.EntityType
+
+        if ($EntityTypeMap.ContainsKey($EntityTypeRef)) {
+            $TypeInfo = $EntityTypeMap[$EntityTypeRef]
+
+            [void]$Catalogue.Add([PSCustomObject]@{
+                EntitySetName        = $EntitySetName
+                EntityType           = $EntityTypeRef
+                TypeName             = $TypeInfo.Name
+                Properties           = $TypeInfo.Properties
+                NavigationProperties = $TypeInfo.NavigationProperties
+            })
+        }
+    }
+
+    return $Catalogue
+}
+
+function Resolve-ODataEntitySetBySignature {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Catalogue,
+
+        [string[]]$RequiredAll = @(),
+
+        [string[]]$RequiredAny = @(),
+
+        [string[]]$Preferred = @(),
+
+        [string]$Purpose = "Unknown"
+    )
+
+    $Candidates = foreach ($Entity in $Catalogue) {
+        $Properties = @($Entity.Properties)
+        $HasAllRequired = $true
+
+        foreach ($RequiredProperty in $RequiredAll) {
+            if ($Properties -notcontains $RequiredProperty) {
+                $HasAllRequired = $false
+                break
+            }
+        }
+
+        if (-not $HasAllRequired) {
+            continue
+        }
+
+        $AnyMatches = @()
+
+        if ($RequiredAny.Count -gt 0) {
+            $AnyMatches = @($RequiredAny | Where-Object { $Properties -contains $_ })
+
+            if ($AnyMatches.Count -eq 0) {
+                continue
+            }
+        }
+
+        $PreferredMatches = @($Preferred | Where-Object { $Properties -contains $_ })
+
+        [PSCustomObject]@{
+            EntitySetName         = $Entity.EntitySetName
+            EntityType            = $Entity.EntityType
+            TypeName              = $Entity.TypeName
+            Properties            = $Entity.Properties
+            NavigationProperties  = $Entity.NavigationProperties
+            RequiredAnyMatchCount = $AnyMatches.Count
+            PreferredMatchCount   = $PreferredMatches.Count
+            TotalMatchScore       = ($RequiredAll.Count * 20) + ($AnyMatches.Count * 10) + ($PreferredMatches.Count * 3)
+        }
+    }
+
+    $BestMatch = $Candidates |
+        Sort-Object TotalMatchScore, PreferredMatchCount, RequiredAnyMatchCount -Descending |
+        Select-Object -First 1
+
+    if (-not $BestMatch) {
+        Write-Warning "Could not resolve an OData entity set for '$Purpose'."
+        return $null
+    }
+
+    Write-Host "Resolved '$Purpose' to entity set '$($BestMatch.EntitySetName)'." -ForegroundColor DarkCyan
+    return $BestMatch
+}
+
+function Resolve-FirstAvailableProperty {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$AvailableProperties,
+
+        [Parameter(Mandatory)]
+        [string[]]$PreferredNames,
+
+        [Parameter(Mandatory)]
+        [string]$Purpose,
+
+        [switch]$Quiet
+    )
+
+    foreach ($Name in $PreferredNames) {
+        if ($AvailableProperties -contains $Name) {
+            return $Name
+        }
+    }
+
+    if (-not $Quiet) {
+        Write-Warning "Could not resolve property for '$Purpose'. Tested: $($PreferredNames -join ', ')"
+    }
+
+    return $null
+}
+
+#------------------------------------------------------------------------------
+# Metric Helpers
+#------------------------------------------------------------------------------
+
+function Get-MetricEntityScore {
+    param(
+        [Parameter(Mandatory)]
+        [object]$MetricEntity
+    )
+
+    $Name = [string]$MetricEntity.EntitySetName
+    $Props = @($MetricEntity.Properties)
+    $Score = 0
+
+    if ($Name -match '^ResourceUtilizationSummary$') { $Score += 100 }
+    elseif ($Name -match '^ResourceUtilization$')    { $Score += 90 }
+    elseif ($Name -match '^LoadIndexes$')            { $Score += 60 }
+    elseif ($Name -match 'Desktop|Server')           { $Score += 50 }
+
+    if ($Name -match 'User')    { $Score -= 40 }
+    if ($Name -match 'Process') { $Score -= 50 }
+
+    foreach ($PropertyName in @("AvgPercentCpu", "AveragePercentCpu", "AvgUsedMemory", "AverageUsedMemory")) {
+        if ($Props -contains $PropertyName) {
+            $Score += 25
+        }
+    }
+
+    if ($Props -contains "Cpu")    { $Score += 10 }
+    if ($Props -contains "Memory") { $Score += 10 }
+
+    foreach ($PropertyName in @("MachineId", "MachineGuid", "MachineKey")) {
+        if ($Props -contains $PropertyName) {
+            $Score += 20
+        }
+    }
+
+    return $Score
+}
+
+function Get-NormalizedMetricsMap {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$MetricsTable,
+
+        [Parameter(Mandatory)]
+        [string[]]$MetricProperties,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$MachineNameLookupIndex,
+
+        [int]$SourceScore = 0,
+
+        [string]$SourceEntityName = ""
+    )
+
+    $ResultingMap = @{}
+
+    if (-not $MetricsTable -or $MetricsTable.Count -eq 0) {
+        return $ResultingMap
+    }
+
+    $MachineReferenceProperty = Resolve-FirstAvailableProperty `
+        -AvailableProperties $MetricProperties `
+        -PreferredNames @("MachineId", "MachineKey", "MachineGuid", "MachineUUID", "MachineUid", "MachineUId", "Guid", "Id") `
+        -Purpose "Metric machine reference" `
+        -Quiet
+
+    $MachineNameMetricProperty = Resolve-FirstAvailableProperty `
+        -AvailableProperties $MetricProperties `
+        -PreferredNames @("MachineName", "HostedMachineName", "Name", "DnsName", "DNSName") `
+        -Purpose "Metric machine name" `
+        -Quiet
+
+    $CpuProperty = Resolve-FirstAvailableProperty `
+        -AvailableProperties $MetricProperties `
+        -PreferredNames @("AvgPercentCpu", "AveragePercentCpu", "PeakPercentCpu", "AvgCpuUtil", "CpuPercent", "CpuPercentage", "Cpu", "ProcessorUsage") `
+        -Purpose "Metric CPU" `
+        -Quiet
+
+    $MemoryProperty = Resolve-FirstAvailableProperty `
+        -AvailableProperties $MetricProperties `
+        -PreferredNames @("AvgUsedMemory", "AverageUsedMemory", "PeakPercentMemory", "AvgMemoryUtil", "MemoryPercent", "MemoryPercentage", "Memory", "UsedMemory") `
+        -Purpose "Metric memory" `
+        -Quiet
+
+    if (-not $MachineReferenceProperty -and -not $MachineNameMetricProperty) {
+        return $ResultingMap
+    }
+
+    $RowsWithKey = foreach ($Row in $MetricsTable) {
+        $ResolvedKey = $null
+
+        if ($MachineReferenceProperty -and $null -ne $Row.$MachineReferenceProperty) {
+            $MachineRef = Convert-ToNormalisedReferenceString -Value $Row.$MachineReferenceProperty
+
+            if ($MachineRef -and $MachineNameLookupIndex.ContainsKey($MachineRef)) {
+                $ResolvedKey = $MachineNameLookupIndex[$MachineRef]
+            }
+        }
+
+        if (-not $ResolvedKey -and $MachineNameMetricProperty -and $null -ne $Row.$MachineNameMetricProperty) {
+            $ResolvedKey = Get-ShortMachineName -MachineName $Row.$MachineNameMetricProperty
+        }
+
+        if ($ResolvedKey) {
+            [PSCustomObject]@{
+                MachineName = $ResolvedKey
+                Row         = $Row
+            }
+        }
+    }
+
+    $GroupedMetrics = $RowsWithKey | Group-Object -Property MachineName
+
+    foreach ($Group in $GroupedMetrics) {
+        $CpuList = [System.Collections.Generic.List[double]]::new()
+        $MemList = [System.Collections.Generic.List[double]]::new()
+
+        foreach ($WrappedRow in $Group.Group) {
+            $Row = $WrappedRow.Row
+
+            if ($CpuProperty -and $null -ne $Row.$CpuProperty) {
+                [void]$CpuList.Add([double]$Row.$CpuProperty)
+            }
+
+            if ($MemoryProperty -and $null -ne $Row.$MemoryProperty) {
+                [void]$MemList.Add([double]$Row.$MemoryProperty)
+            }
+        }
+
+        $AvgCpu = if ($CpuList.Count -gt 0) {
+            ($CpuList | Measure-Object -Average).Average
         }
         else {
-            $SessionDetails = "Shared Desktop Session"
-            $NumericSessionTypeTag = "1"
+            $null
+        }
+
+        $AvgMem = if ($MemList.Count -gt 0) {
+            ($MemList | Measure-Object -Average).Average
+        }
+        else {
+            $null
+        }
+
+        $ResultingMap[$Group.Name] = [PSCustomObject]@{
+            Cpu            = $AvgCpu
+            Mem            = $AvgMem
+            CpuProperty    = $CpuProperty
+            MemoryProperty = $MemoryProperty
+            SourceScore    = $SourceScore
+            SourceEntity   = $SourceEntityName
         }
     }
 
-    # PRODUCTION HYBRID ROUTING MATRIX: Combines string GUID checks with composite profile filters
-    $FoundPerformanceMetrics = $false
-    $SessionMachineStringGuidKey = if ($Session.MachineId) { $Session.MachineId.ToString().Trim().ToLower() } else { "" }
-    
-    if ($MachineOS -match "Windows 10|Windows 11|Windows 7|Windows 8") {
-        # FIXED: Direct matching validation using the verified Block 1 String GUID key formatting
-        if ($SessionMachineStringGuidKey -and $HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
-            $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
-            if ($MetricsObject.AvgCpu -ne $null) { $SessionCpu = "$([Math]::Round($MetricsObject.AvgCpu))%" }
-            if ($MetricsObject.AvgMem -gt 0) { $SessionMem = "{0:N0} MB" -f ($MetricsObject.AvgMem / 1MB) }
-            $FoundPerformanceMetrics = $true
+    return $ResultingMap
+}
+
+#------------------------------------------------------------------------------
+# OData Discovery
+#------------------------------------------------------------------------------
+
+Write-Section "Resolving Citrix Monitor OData Endpoint"
+
+$ControllerAddress = Resolve-ControllerAddress -InputControllerAddress $ControllerAddress
+$BaseUrl = Resolve-MonitorODataBaseUrl -ControllerAddress $ControllerAddress -PreferHttp:$PreferHttp
+
+if ((Test-Blank $BaseUrl) -or $BaseUrl -notmatch '^https?://') {
+    throw "BaseUrl is invalid or empty: '$BaseUrl'"
+}
+
+$PastDateUTC = [System.DateTime]::UtcNow.AddDays(-$LookbackDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+Write-Section "Discovering Monitor OData Schema from Metadata"
+
+$Metadata = Get-ODataMetadataDocument -BaseUrl $BaseUrl
+$Catalogue = Get-ODataEntitySetCatalogue -Metadata $Metadata
+
+if (-not $Catalogue -or $Catalogue.Count -eq 0) {
+    throw "No OData entity sets were discovered from Monitor metadata."
+}
+
+$UserEntity = Resolve-ODataEntitySetBySignature `
+    -Catalogue $Catalogue `
+    -RequiredAll @("Id") `
+    -RequiredAny @("UserName", "Name") `
+    -Preferred @("UserName", "Sid", "SID", "Domain", "Upn", "UPN") `
+    -Purpose "Users"
+
+$MachineEntity = Resolve-ODataEntitySetBySignature `
+    -Catalogue $Catalogue `
+    -RequiredAll @("Id") `
+    -RequiredAny @("Name", "MachineName", "MachineGuid", "HostedMachineName", "DnsName", "DNSName") `
+    -Preferred @(
+        "DesktopGroupId",
+        "DesktopGroupKey",
+        "DesktopGroupUid",
+        "DesktopGroupUId",
+        "DeliveryGroupId",
+        "DeliveryGroupKey",
+        "DesktopGroupName",
+        "DeliveryGroupName",
+        "GroupName",
+        "SessionSupport",
+        "DesktopKind",
+        "AllocationType",
+        "MachineRole",
+        "MachineType",
+        "OSName",
+        "OperatingSystem"
+    ) `
+    -Purpose "Machines"
+
+$GroupEntity = Resolve-ODataEntitySetBySignature `
+    -Catalogue $Catalogue `
+    -RequiredAll @("Id") `
+    -RequiredAny @("GroupName", "Name", "PublishedName", "DisplayName", "DesktopGroupName", "DeliveryGroupName") `
+    -Preferred @("GroupName", "DesktopGroupName", "DeliveryGroupName", "Name", "PublishedName") `
+    -Purpose "Delivery Groups"
+
+$ApplicationEntity = Resolve-ODataEntitySetBySignature `
+    -Catalogue $Catalogue `
+    -RequiredAll @("Id") `
+    -RequiredAny @("PublishedName", "ApplicationName", "Name", "DisplayName") `
+    -Preferred @("PublishedName", "ApplicationName", "Name", "BrowserName") `
+    -Purpose "Published Applications"
+
+$SessionEntity = Resolve-ODataEntitySetBySignature `
+    -Catalogue $Catalogue `
+    -RequiredAny @("StartDate", "LogOnStartDate", "CreatedDate") `
+    -Preferred @(
+        "UserId",
+        "UserKey",
+        "UserUid",
+        "UserUId",
+        "MachineId",
+        "MachineKey",
+        "MachineGuid",
+        "MachineUUID",
+        "MachineUid",
+        "MachineUId",
+        "DesktopGroupId",
+        "DesktopGroupKey",
+        "DesktopGroupUid",
+        "DesktopGroupUId",
+        "DeliveryGroupId",
+        "DeliveryGroupKey",
+        "DesktopGroupName",
+        "DeliveryGroupName",
+        "GroupName",
+        "SessionType",
+        "Type",
+        "ConnectionState",
+        "EndDate",
+        "ApplicationId",
+        "ApplicationKey",
+        "ApplicationUid",
+        "ApplicationUId",
+        "AppId",
+        "AppKey"
+    ) `
+    -Purpose "Sessions"
+
+if (-not $SessionEntity) {
+    throw "Session entity set could not be discovered. Cannot continue."
+}
+
+$ApplicationUsageEntities = @(
+    $Catalogue | Where-Object {
+        $EntityName = [string]$_.EntitySetName
+        $Props = @($_.Properties)
+
+        $HasAppClue = @(
+            "ApplicationId",
+            "ApplicationKey",
+            "ApplicationUid",
+            "ApplicationUId",
+            "AppId",
+            "AppKey",
+            "PublishedApplicationId",
+            "PublishedApplicationKey",
+            "PublishedApplicationUid",
+            "PublishedApplicationUId",
+            "ApplicationName",
+            "PublishedName",
+            "PublishedApplicationName",
+            "AppName",
+            "BrowserName",
+            "ResourceName",
+            "PublishedResourceName",
+            "Name"
+        ) | Where-Object { $Props -contains $_ }
+
+        $HasRefClue = @(
+            "SessionId",
+            "SessionKey",
+            "SessionUid",
+            "SessionUId",
+            "SessionGuid",
+            "SessionUUID",
+            "ConnectionId",
+            "ConnectionKey",
+            "ConnectionUid",
+            "ConnectionUId",
+            "ConnectionGuid",
+            "ConnectionUUID",
+            "LogOnId",
+            "LogonId",
+            "LogOnKey",
+            "LogonKey",
+            "UserId",
+            "UserKey",
+            "UserUid",
+            "UserUId",
+            "UserName",
+            "User",
+            "MachineId",
+            "MachineKey",
+            "MachineGuid",
+            "MachineUUID",
+            "MachineUid",
+            "MachineUId",
+            "MachineName",
+            "HostedMachineName",
+            "DnsName",
+            "DNSName"
+        ) | Where-Object { $Props -contains $_ }
+
+        ($EntityName -notmatch '^SpaApplications$') -and
+        ($EntityName -match 'Application|App|Launch|Instance|Resource') -and
+        ($HasAppClue.Count -gt 0) -and
+        ($HasRefClue.Count -gt 0)
+    } |
+    ForEach-Object {
+        $Props = @($_.Properties)
+        $Score = 0
+
+        if ($_.EntitySetName -match 'ApplicationInstance') { $Score += 60 }
+        if ($_.EntitySetName -match 'Application')         { $Score += 40 }
+        if ($_.EntitySetName -match 'Launch')              { $Score += 30 }
+        if ($_.EntitySetName -match 'Resource')            { $Score += 20 }
+
+        foreach ($PropertyName in @("SessionId", "ConnectionId", "LogOnId", "LogonId")) {
+            if ($Props -contains $PropertyName) {
+                $Score += 20
+            }
         }
-    } else {
-        # Match multi-session workloads using production-aligned composite lookup dictionary tags
-        if ($AccountUser -and $AccountUser -ne "Unknown") {
-            $CleanTextUserNameKey = $AccountUser.ToString().Trim().ToLower()
-            $CompositeTextLookupKey = "$CleanTextUserNameKey-$NumericSessionTypeTag"
-            
-            if ($UserPerfLookup.ContainsKey($CompositeTextLookupKey)) {
-                $TargetPerformanceRecords = $UserPerfLookup[$CompositeTextLookupKey]
-                $CleanCpuData = $TargetPerformanceRecords | ForEach-Object { if ($_.PeakPercentCpu -ne $null) { [double]$_.PeakPercentCpu } } | Where-Object { $_ -gt 0 }
-                $CleanMemData = $TargetPerformanceRecords | ForEach-Object { if ($_.PeakPercentMemory -ne $null) { [double]$_.PeakPercentMemory } } | Where-Object { $_ -gt 0 }
-                
-                if ($CleanCpuData) { $SessionCpu = "$([Math]::Round(($CleanCpuData | Measure-Object -Average).Average))%" }
-                if ($CleanMemData) { $SessionMem = "$([Math]::Round(($CleanMemData | Measure-Object -Average).Average))% Load" }
-                $FoundPerformanceMetrics = $true
+
+        foreach ($PropertyName in @("UserId", "UserKey", "MachineId", "MachineKey", "MachineName", "StartDate", "CreatedDate")) {
+            if ($Props -contains $PropertyName) {
+                $Score += 10
+            }
+        }
+
+        $_ | Add-Member -NotePropertyName ApplicationUsageScore -NotePropertyValue $Score -Force
+        $_
+    } |
+    Sort-Object ApplicationUsageScore -Descending
+)
+
+Write-Host "Discovered $($ApplicationUsageEntities.Count) candidate application-usage/evidence entity set(s)." -ForegroundColor DarkCyan
+
+$MetricEntities = @(
+    $Catalogue | Where-Object {
+        $Props = @($_.Properties)
+
+        $HasMachineReference = @(
+            "MachineId",
+            "MachineKey",
+            "MachineGuid",
+            "MachineUUID",
+            "MachineUid",
+            "MachineUId",
+            "Guid",
+            "Id",
+            "MachineName",
+            "HostedMachineName",
+            "Name"
+        ) | Where-Object { $Props -contains $_ }
+
+        $HasCpuMetric = @(
+            "AvgPercentCpu",
+            "AveragePercentCpu",
+            "PeakPercentCpu",
+            "AvgCpuUtil",
+            "CpuPercent",
+            "CpuPercentage",
+            "Cpu",
+            "ProcessorUsage"
+        ) | Where-Object { $Props -contains $_ }
+
+        $HasMemoryMetric = @(
+            "AvgUsedMemory",
+            "AverageUsedMemory",
+            "PeakPercentMemory",
+            "AvgMemoryUtil",
+            "MemoryPercent",
+            "MemoryPercentage",
+            "Memory",
+            "UsedMemory"
+        ) | Where-Object { $Props -contains $_ }
+
+        $HasDate = @("SummaryDate", "CreatedDate", "StartDate", "Date") |
+            Where-Object { $Props -contains $_ }
+
+        $HasMachineReference.Count -gt 0 -and
+        ($HasCpuMetric.Count -gt 0 -or $HasMemoryMetric.Count -gt 0) -and
+        $HasDate.Count -gt 0
+    } |
+    ForEach-Object {
+        $_ | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-MetricEntityScore -MetricEntity $_) -Force
+        $_
+    } |
+    Sort-Object MetricScore -Descending
+)
+
+Write-Host "Discovered $($MetricEntities.Count) candidate metric entity set(s)." -ForegroundColor DarkCyan
+
+#------------------------------------------------------------------------------
+# Property Resolution
+#------------------------------------------------------------------------------
+
+Write-Section "Resolving Runtime Property Names"
+
+$UserNameProperty = if ($UserEntity) {
+    Resolve-FirstAvailableProperty `
+        -AvailableProperties $UserEntity.Properties `
+        -PreferredNames @("UserName", "Name", "DisplayName", "Upn", "UPN") `
+        -Purpose "User display name"
+}
+
+$MachineNameProperty = if ($MachineEntity) {
+    Resolve-FirstAvailableProperty `
+        -AvailableProperties $MachineEntity.Properties `
+        -PreferredNames @("Name", "HostedMachineName", "MachineName", "DnsName", "DNSName") `
+        -Purpose "Machine name"
+}
+
+$GroupNameProperty = if ($GroupEntity) {
+    Resolve-FirstAvailableProperty `
+        -AvailableProperties $GroupEntity.Properties `
+        -PreferredNames @("GroupName", "DesktopGroupName", "DeliveryGroupName", "Name", "PublishedName", "DisplayName") `
+        -Purpose "Delivery group name"
+}
+
+$ApplicationNameProperty = if ($ApplicationEntity) {
+    Resolve-FirstAvailableProperty `
+        -AvailableProperties $ApplicationEntity.Properties `
+        -PreferredNames @("PublishedName", "ApplicationName", "Name", "DisplayName", "BrowserName") `
+        -Purpose "Published application name"
+}
+
+$SessionStartDateProperty = Resolve-FirstAvailableProperty `
+    -AvailableProperties $SessionEntity.Properties `
+    -PreferredNames @("StartDate", "LogOnStartDate", "CreatedDate") `
+    -Purpose "Session start date"
+
+$SessionUserRefProperty = Resolve-FirstAvailableProperty `
+    -AvailableProperties $SessionEntity.Properties `
+    -PreferredNames @("UserId", "UserKey", "UserUid", "UserUId") `
+    -Purpose "Session user reference" `
+    -Quiet
+
+$SessionMachineRefProperty = Resolve-FirstAvailableProperty `
+    -AvailableProperties $SessionEntity.Properties `
+    -PreferredNames @("MachineId", "MachineKey", "MachineGuid", "MachineUUID", "MachineUid", "MachineUId") `
+    -Purpose "Session machine reference" `
+    -Quiet
+
+$SessionApplicationRefProperty = Resolve-FirstAvailableProperty `
+    -AvailableProperties $SessionEntity.Properties `
+    -PreferredNames @("ApplicationId", "ApplicationKey", "ApplicationUid", "ApplicationUId", "AppId", "AppKey") `
+    -Purpose "Session application reference" `
+    -Quiet
+
+$SessionTypeProperty = Resolve-FirstAvailableProperty `
+    -AvailableProperties $SessionEntity.Properties `
+    -PreferredNames @("SessionType", "Type") `
+    -Purpose "Session type" `
+    -Quiet
+
+if (-not $SessionStartDateProperty) {
+    throw "No usable session start date property was discovered."
+}
+
+#------------------------------------------------------------------------------
+# Data Extraction
+#------------------------------------------------------------------------------
+
+Write-Section "Extracting Monitor OData Data"
+
+try {
+    $UsersTable = @()
+    if ($UserEntity) {
+        $UsersTable = Invoke-ODataPagedQuery -Uri (
+            New-ODataEntityUri -BaseUrl $BaseUrl -EntitySetName $UserEntity.EntitySetName
+        )
+    }
+
+    $MachinesTable = @()
+    if ($MachineEntity) {
+        $MachinesTable = Invoke-ODataPagedQuery -Uri (
+            New-ODataEntityUri -BaseUrl $BaseUrl -EntitySetName $MachineEntity.EntitySetName
+        )
+    }
+
+    $GroupsTable = @()
+    if ($GroupEntity) {
+        $GroupsTable = Invoke-ODataPagedQuery -Uri (
+            New-ODataEntityUri -BaseUrl $BaseUrl -EntitySetName $GroupEntity.EntitySetName
+        )
+    }
+
+    $ApplicationsTable = @()
+    if ($ApplicationEntity) {
+        $ApplicationsTable = Invoke-ODataPagedQuery -Uri (
+            New-ODataEntityUri -BaseUrl $BaseUrl -EntitySetName $ApplicationEntity.EntitySetName
+        )
+    }
+
+    $SessionFilter = "$SessionStartDateProperty ge $PastDateUTC"
+
+    $RawSessions = Invoke-ODataPagedQuery -Uri (
+        New-ODataEntityUri `
+            -BaseUrl $BaseUrl `
+            -EntitySetName $SessionEntity.EntitySetName `
+            -Filter $SessionFilter
+    )
+
+    $MetricTables = @{}
+
+    foreach ($MetricEntity in $MetricEntities) {
+        $MetricDateProperty = Resolve-FirstAvailableProperty `
+            -AvailableProperties $MetricEntity.Properties `
+            -PreferredNames @("SummaryDate", "CreatedDate", "StartDate", "Date") `
+            -Purpose "Metric date for $($MetricEntity.EntitySetName)" `
+            -Quiet
+
+        if (Test-Blank $MetricDateProperty) {
+            continue
+        }
+
+        $MetricFilter = "$MetricDateProperty ge $PastDateUTC"
+
+        try {
+            $MetricTables[$MetricEntity.EntitySetName] = Invoke-ODataPagedQuery -Uri (
+                New-ODataEntityUri `
+                    -BaseUrl $BaseUrl `
+                    -EntitySetName $MetricEntity.EntitySetName `
+                    -Filter $MetricFilter
+            )
+        }
+        catch {
+            Write-Warning "Metric extraction failed for '$($MetricEntity.EntitySetName)'. $($_.Exception.Message)"
+        }
+    }
+
+    $ApplicationUsageTables = @{}
+
+    foreach ($ApplicationUsageEntity in $ApplicationUsageEntities) {
+        $UsageDateProperty = Resolve-FirstAvailableProperty `
+            -AvailableProperties $ApplicationUsageEntity.Properties `
+            -PreferredNames @("StartDate", "CreatedDate", "LaunchTime", "LaunchDate", "ConnectionStartDate", "LogOnStartDate", "EndDate", "Date", "SummaryDate") `
+            -Purpose "Application usage date for $($ApplicationUsageEntity.EntitySetName)" `
+            -Quiet
+
+        try {
+            if ($UsageDateProperty) {
+                $UsageFilter = "$UsageDateProperty ge $PastDateUTC"
+
+                $ApplicationUsageTables[$ApplicationUsageEntity.EntitySetName] = Invoke-ODataPagedQuery -Uri (
+                    New-ODataEntityUri `
+                        -BaseUrl $BaseUrl `
+                        -EntitySetName $ApplicationUsageEntity.EntitySetName `
+                        -Filter $UsageFilter
+                )
+            }
+            else {
+                $ApplicationUsageTables[$ApplicationUsageEntity.EntitySetName] = Invoke-ODataPagedQuery -Uri (
+                    New-ODataEntityUri `
+                        -BaseUrl $BaseUrl `
+                        -EntitySetName $ApplicationUsageEntity.EntitySetName
+                )
+            }
+        }
+        catch {
+            Write-Warning "Application usage extraction failed for '$($ApplicationUsageEntity.EntitySetName)'. $($_.Exception.Message)"
+        }
+    }
+}
+catch {
+    Write-Error "CRITICAL: OData discovery or extraction failed. $($_.Exception.Message)"
+
+    if ($script:LastODataUri) {
+        Write-Error "Last attempted OData URI: $script:LastODataUri"
+    }
+
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
+
+if (-not $RawSessions -or $RawSessions.Count -eq 0) {
+    Write-Warning "No session records were located inside the $LookbackDays day lookup window."
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 0
+}
+
+#------------------------------------------------------------------------------
+# OData Lookup Maps
+#------------------------------------------------------------------------------
+
+Write-Section "Building OData Lookup Maps"
+
+$UserMap = @{}
+$MachineLookupByReference = @{}
+$MachineNameByReference = @{}
+$MachineGroupReferenceByMachineReference = @{}
+$MachineGroupNameByReference = @{}
+$MachineGroupNameByCleanName = @{}
+$MachineKindByCleanName = @{}
+$GroupMap = @{}
+$ApplicationLookupMap = @{}
+
+if ($UsersTable -and $UserNameProperty) {
+    foreach ($User in $UsersTable) {
+        $UserDisplayName = [string]$User.$UserNameProperty
+
+        foreach ($KeyProperty in @("Id", "UserId", "UserKey", "UserUid", "UserUId", "Sid", "SID")) {
+            if (($User.PSObject.Properties.Name -contains $KeyProperty) -and $null -ne $User.$KeyProperty) {
+                $Key = Convert-ToNormalisedReferenceString -Value $User.$KeyProperty
+
+                if ($Key) {
+                    $UserMap[$Key] = $UserDisplayName
+                }
             }
         }
     }
-    
-    # SYSTEM-WIDE FALLBACK PIPELINE: Inherits host machine parameters if primary routing yields empty values
-    if (-not $FoundPerformanceMetrics -and $SessionMachineStringGuidKey) {
-        if ($HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
-            $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
-            
-            if ($MetricsObject.AvgCpu -ne $null) { 
-                $SessionCpu = "$([Math]::Round($MetricsObject.AvgCpu))%" 
+}
+
+if ($MachinesTable -and $MachineNameProperty) {
+    foreach ($Machine in $MachinesTable) {
+        $MachineName = [string]$Machine.$MachineNameProperty
+        $CleanMachineName = Get-ShortMachineName -MachineName $MachineName
+
+        if (Test-Blank $CleanMachineName) {
+            continue
+        }
+
+        $MachineGroupReference = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @(
+                "DesktopGroupId",
+                "DesktopGroupKey",
+                "DesktopGroupUid",
+                "DesktopGroupUId",
+                "DeliveryGroupId",
+                "DeliveryGroupKey",
+                "GroupId",
+                "GroupKey"
+            )
+
+        $MachineGroupName = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @(
+                "DesktopGroupName",
+                "DeliveryGroupName",
+                "GroupName",
+                "PublishedDesktopName",
+                "DesktopName"
+            )
+
+        if ($MachineGroupName) {
+            $MachineGroupNameByCleanName[$CleanMachineName] = [string]$MachineGroupName
+        }
+
+        $MachineKindText = Get-ObjectPropertyValue `
+            -InputObject $Machine `
+            -PropertyNames @(
+                "SessionSupport",
+                "DesktopKind",
+                "AllocationType",
+                "MachineRole",
+                "MachineType",
+                "OSType",
+                "OSName",
+                "OperatingSystem"
+            )
+
+        if ($MachineKindText) {
+            $MachineKindByCleanName[$CleanMachineName] = [string]$MachineKindText
+        }
+
+        foreach ($KeyProperty in @("Id", "MachineId", "MachineKey", "MachineGuid", "MachineUUID", "MachineUid", "MachineUId", "Guid", "UUID")) {
+            if (($Machine.PSObject.Properties.Name -contains $KeyProperty) -and $null -ne $Machine.$KeyProperty) {
+                $KeyString = Convert-ToNormalisedReferenceString -Value $Machine.$KeyProperty
+
+                if ($KeyString) {
+                    $MachineLookupByReference[$KeyString] = $Machine
+                    $MachineNameByReference[$KeyString] = $CleanMachineName
+
+                    if ($MachineGroupReference) {
+                        $MachineGroupReferenceByMachineReference[$KeyString] = $MachineGroupReference
+                    }
+
+                    if ($MachineGroupName) {
+                        $MachineGroupNameByReference[$KeyString] = [string]$MachineGroupName
+                    }
+                }
             }
-            if ($MetricsObject.AvgMem -gt 0) { 
-                if ($MetricsObject.AvgMem -gt 100000) {
-                    $SessionMem = "{0:N0} MB" -f ($MetricsObject.AvgMem / 1MB)
-                } else {
-                    $SessionMem = "$([Math]::Round($MetricsObject.AvgMem))% Load"
+        }
+    }
+}
+
+if ($GroupsTable -and $GroupNameProperty) {
+    foreach ($Group in $GroupsTable) {
+        foreach ($KeyProperty in @("Id", "GroupId", "GroupKey", "DesktopGroupId", "DesktopGroupKey", "DesktopGroupUid", "DesktopGroupUId", "DeliveryGroupId", "DeliveryGroupKey", "Uid", "UId")) {
+            if (($Group.PSObject.Properties.Name -contains $KeyProperty) -and $null -ne $Group.$KeyProperty) {
+                $Key = Convert-ToNormalisedReferenceString -Value $Group.$KeyProperty
+
+                if ($Key) {
+                    $GroupMap[$Key] = [string]$Group.$GroupNameProperty
+                }
+            }
+        }
+    }
+}
+
+if ($ApplicationsTable -and $ApplicationNameProperty) {
+    foreach ($Application in $ApplicationsTable) {
+        foreach ($KeyProperty in @("Id", "ApplicationId", "ApplicationKey", "ApplicationUid", "ApplicationUId", "AppId", "AppKey", "Uid", "UId")) {
+            if (($Application.PSObject.Properties.Name -contains $KeyProperty) -and $null -ne $Application.$KeyProperty) {
+                $Key = Convert-ToNormalisedReferenceString -Value $Application.$KeyProperty
+
+                if ($Key) {
+                    $ApplicationLookupMap[$Key] = [string]$Application.$ApplicationNameProperty
+                }
+            }
+        }
+    }
+}
+
+Write-Host "User lookup entries          : $($UserMap.Count)" -ForegroundColor DarkCyan
+Write-Host "Machine lookup entries       : $($MachineNameByReference.Count)" -ForegroundColor DarkCyan
+Write-Host "OData delivery group entries : $($GroupMap.Count)" -ForegroundColor DarkCyan
+Write-Host "Application lookup entries   : $($ApplicationLookupMap.Count)" -ForegroundColor DarkCyan
+
+#------------------------------------------------------------------------------
+# Broker SDK Fallback Maps
+#------------------------------------------------------------------------------
+
+Write-Section "Building Citrix Broker SDK Fallback Maps"
+
+$BrokerFallbackMaps = Get-BrokerInventoryFallbackMaps
+
+#------------------------------------------------------------------------------
+# Application Evidence Maps
+#------------------------------------------------------------------------------
+
+Write-Section "Building Application Evidence Maps"
+
+$SessionApplicationNameMap = @{}
+$ApplicationEvidenceRows = [System.Collections.Generic.List[object]]::new()
+
+foreach ($ApplicationUsageEntity in $ApplicationUsageEntities) {
+    if (-not $ApplicationUsageTables.ContainsKey($ApplicationUsageEntity.EntitySetName)) {
+        continue
+    }
+
+    $Rows = @($ApplicationUsageTables[$ApplicationUsageEntity.EntitySetName])
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        continue
+    }
+
+    Write-Host "Processing application evidence rows from '$($ApplicationUsageEntity.EntitySetName)': $($Rows.Count)" -ForegroundColor DarkCyan
+
+    foreach ($Row in $Rows) {
+        $ResolvedAppName = Get-ObjectPropertyValue `
+            -InputObject $Row `
+            -PropertyNames @(
+                "PublishedApplicationName",
+                "ApplicationName",
+                "AppName",
+                "BrowserName",
+                "PublishedResourceName",
+                "ResourceName",
+                "PublishedName",
+                "Name"
+            )
+
+        if (-not $ResolvedAppName) {
+            $AppRefs = Get-RowReferenceValues `
+                -InputObject $Row `
+                -CandidateProperties @(
+                    "ApplicationId",
+                    "ApplicationKey",
+                    "ApplicationUid",
+                    "ApplicationUId",
+                    "AppId",
+                    "AppKey",
+                    "PublishedApplicationId",
+                    "PublishedApplicationKey",
+                    "PublishedApplicationUid",
+                    "PublishedApplicationUId"
+                )
+
+            foreach ($AppRef in $AppRefs) {
+                if ($ApplicationLookupMap.ContainsKey($AppRef)) {
+                    $ResolvedAppName = $ApplicationLookupMap[$AppRef]
+                    break
+                }
+            }
+        }
+
+        if (-not $ResolvedAppName) {
+            continue
+        }
+
+        $SessionRefs = Get-RowReferenceValues `
+            -InputObject $Row `
+            -CandidateProperties @(
+                "SessionId",
+                "SessionKey",
+                "SessionUid",
+                "SessionUId",
+                "SessionGuid",
+                "SessionUUID",
+                "ConnectionId",
+                "ConnectionKey",
+                "ConnectionUid",
+                "ConnectionUId",
+                "ConnectionGuid",
+                "ConnectionUUID",
+                "LogOnId",
+                "LogonId",
+                "LogOnKey",
+                "LogonKey"
+            )
+
+        foreach ($SessionRef in $SessionRefs) {
+            if (-not $SessionApplicationNameMap.ContainsKey($SessionRef)) {
+                $SessionApplicationNameMap[$SessionRef] = [System.Collections.Generic.List[string]]::new()
+            }
+
+            if (-not $SessionApplicationNameMap[$SessionRef].Contains([string]$ResolvedAppName)) {
+                [void]$SessionApplicationNameMap[$SessionRef].Add([string]$ResolvedAppName)
+            }
+        }
+
+        $EvidenceUserRefs = Get-RowReferenceValues `
+            -InputObject $Row `
+            -CandidateProperties @("UserId", "UserKey", "UserUid", "UserUId", "UserSid", "SID", "Sid")
+
+        $EvidenceUserNames = Get-RowReferenceValues `
+            -InputObject $Row `
+            -CandidateProperties @("UserName", "User", "AccountName", "SamAccountName", "UPN", "Upn")
+
+        $EvidenceMachineRefs = Get-RowReferenceValues `
+            -InputObject $Row `
+            -CandidateProperties @("MachineId", "MachineKey", "MachineGuid", "MachineUUID", "MachineUid", "MachineUId")
+
+        $EvidenceMachineNames = Get-RowReferenceValues `
+            -InputObject $Row `
+            -CandidateProperties @("MachineName", "HostedMachineName", "DnsName", "DNSName", "ServerName", "VdaName", "VDAName")
+
+        $EvidenceTime = Get-FirstDatePropertyValue `
+            -InputObject $Row `
+            -PropertyNames @(
+                "StartDate",
+                "CreatedDate",
+                "LaunchTime",
+                "LaunchDate",
+                "ConnectionStartDate",
+                "LogOnStartDate",
+                "EndDate",
+                "Date",
+                "SummaryDate"
+            )
+
+        [void]$ApplicationEvidenceRows.Add([PSCustomObject]@{
+            EntitySetName = $ApplicationUsageEntity.EntitySetName
+            AppName       = [string]$ResolvedAppName
+            SessionRefs   = $SessionRefs
+            UserRefs      = $EvidenceUserRefs
+            UserNames     = $EvidenceUserNames
+            MachineRefs   = $EvidenceMachineRefs
+            MachineNames  = $EvidenceMachineNames
+            EvidenceTime  = $EvidenceTime
+            RawRow        = $Row
+        })
+    }
+}
+
+Write-Host "Session application mapping entries: $($SessionApplicationNameMap.Count)" -ForegroundColor DarkCyan
+Write-Host "Application evidence rows          : $($ApplicationEvidenceRows.Count)" -ForegroundColor DarkCyan
+
+function Resolve-ApplicationFromEvidence {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$SessionRefs,
+
+        [AllowNull()]
+        [string]$SessionUserRef,
+
+        [AllowNull()]
+        [string]$SessionUserName,
+
+        [AllowNull()]
+        [string]$SessionMachineRef,
+
+        [AllowNull()]
+        [string]$CleanVdaHostName,
+
+        [AllowNull()]
+        [object]$SessionStartTime,
+
+        [Parameter(Mandatory)]
+        [object[]]$ApplicationEvidence
+    )
+
+    foreach ($SessionRef in $SessionRefs) {
+        $ExactMatches = @(
+            $ApplicationEvidence | Where-Object {
+                $_.SessionRefs -contains $SessionRef
+            }
+        )
+
+        if ($ExactMatches.Count -gt 0) {
+            return (($ExactMatches.AppName | Sort-Object -Unique) -join ", ")
+        }
+    }
+
+    $NormalisedSessionUserName = Convert-ToNormalisedReferenceString -Value $SessionUserName
+
+    $CandidateMatches = foreach ($Evidence in $ApplicationEvidence) {
+        $Score = 0
+
+        if ($SessionUserRef -and $Evidence.UserRefs -contains $SessionUserRef) {
+            $Score += 45
+        }
+
+        if ($NormalisedSessionUserName -and $Evidence.UserNames -contains $NormalisedSessionUserName) {
+            $Score += 45
+        }
+
+        if ($SessionMachineRef -and $Evidence.MachineRefs -contains $SessionMachineRef) {
+            $Score += 45
+        }
+
+        if ($CleanVdaHostName -and $Evidence.MachineNames) {
+            foreach ($EvidenceMachineName in $Evidence.MachineNames) {
+                if ((Get-ShortMachineName -MachineName $EvidenceMachineName) -eq $CleanVdaHostName) {
+                    $Score += 45
+                    break
+                }
+            }
+        }
+
+        if ($SessionStartTime -and $Evidence.EvidenceTime) {
+            $Score += Get-SessionTimeWindowMatchScore `
+                -SessionStart ([DateTime]$SessionStartTime) `
+                -EvidenceTime ([DateTime]$Evidence.EvidenceTime)
+        }
+
+        if ($Score -ge 80) {
+            [PSCustomObject]@{
+                AppName = $Evidence.AppName
+                Score   = $Score
+                Time    = $Evidence.EvidenceTime
+                Entity  = $Evidence.EntitySetName
+            }
+        }
+    }
+
+    $BestMatches = @(
+        $CandidateMatches |
+            Sort-Object Score -Descending |
+            Select-Object -First 5
+    )
+
+    if ($BestMatches.Count -gt 0) {
+        $TopScore = ($BestMatches | Select-Object -First 1).Score
+
+        $TopApps = @(
+            $BestMatches |
+                Where-Object { $_.Score -eq $TopScore } |
+                Select-Object -ExpandProperty AppName |
+                Sort-Object -Unique
+        )
+
+        if ($TopApps.Count -gt 0) {
+            return ($TopApps -join ", ")
+        }
+    }
+
+    return $null
+}
+
+function Resolve-SingleApplicationFallback {
+    param(
+        [AllowNull()]
+        [string]$SessionUserRef,
+
+        [AllowNull()]
+        [string]$SessionUserName,
+
+        [Parameter(Mandatory)]
+        [object[]]$ApplicationEvidence
+    )
+
+    $NormalisedSessionUserName = Convert-ToNormalisedReferenceString -Value $SessionUserName
+
+    $UserMatches = @(
+        $ApplicationEvidence | Where-Object {
+            ($SessionUserRef -and $_.UserRefs -contains $SessionUserRef) -or
+            ($NormalisedSessionUserName -and $_.UserNames -contains $NormalisedSessionUserName)
+        }
+    )
+
+    if ($UserMatches.Count -gt 0) {
+        $DistinctUserApps = @($UserMatches | Select-Object -ExpandProperty AppName -Unique)
+
+        if ($DistinctUserApps.Count -eq 1) {
+            return $DistinctUserApps[0]
+        }
+    }
+
+    return $null
+}
+
+if ($EnableApplicationDiagnostics) {
+    Write-Section "Application Evidence Diagnostics"
+
+    foreach ($Evidence in $ApplicationEvidenceRows) {
+        if ($Evidence.AppName -match 'notepad|calculator|calc') {
+            Write-Host "Evidence: App=$($Evidence.AppName); Entity=$($Evidence.EntitySetName); Time=$($Evidence.EvidenceTime); Users=$($Evidence.UserNames -join ','); Machines=$($Evidence.MachineNames -join ',')" -ForegroundColor DarkYellow
+        }
+    }
+}
+
+#------------------------------------------------------------------------------
+# Metric Normalisation
+#------------------------------------------------------------------------------
+
+Write-Section "Normalising Performance Metrics"
+
+$PerformanceTelemetryMap = @{}
+
+foreach ($MetricEntity in $MetricEntities) {
+    if (-not $MetricTables.ContainsKey($MetricEntity.EntitySetName)) {
+        continue
+    }
+
+    $MetricRows = $MetricTables[$MetricEntity.EntitySetName]
+
+    if (-not $MetricRows -or $MetricRows.Count -eq 0) {
+        continue
+    }
+
+    $MetricMap = Get-NormalizedMetricsMap `
+        -MetricsTable $MetricRows `
+        -MetricProperties $MetricEntity.Properties `
+        -MachineNameLookupIndex $MachineNameByReference `
+        -SourceScore $MetricEntity.MetricScore `
+        -SourceEntityName $MetricEntity.EntitySetName
+
+    foreach ($Key in $MetricMap.Keys) {
+        if (-not $PerformanceTelemetryMap.ContainsKey($Key)) {
+            $PerformanceTelemetryMap[$Key] = $MetricMap[$Key]
+        }
+        elseif ($MetricMap[$Key].SourceScore -gt $PerformanceTelemetryMap[$Key].SourceScore) {
+            $PerformanceTelemetryMap[$Key] = $MetricMap[$Key]
+        }
+    }
+}
+
+Write-Host "Normalised performance telemetry for $($PerformanceTelemetryMap.Count) machine(s)." -ForegroundColor DarkCyan
+
+#------------------------------------------------------------------------------
+# Session Processing
+#------------------------------------------------------------------------------
+
+Write-Section "Processing Session Records"
+
+$OutputRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($Session in $RawSessions) {
+    $ResolvedUser = "System Account / Unresolved"
+    $SessionUserRefNormalised = $null
+
+    if ($SessionUserRefProperty) {
+        $SessionUserRef = $Session.$SessionUserRefProperty
+
+        if ($null -ne $SessionUserRef) {
+            $SessionUserRefNormalised = Convert-ToNormalisedReferenceString -Value $SessionUserRef
+
+            if ($SessionUserRefNormalised -and $UserMap.ContainsKey($SessionUserRefNormalised)) {
+                $ResolvedUser = $UserMap[$SessionUserRefNormalised]
+            }
+        }
+    }
+
+    if ($ResolvedUser -eq "Unknown User") {
+        $ResolvedUser = "System Account / Unresolved"
+    }
+
+    $VdaHostName = "Unknown"
+    $CleanVdaHostName = "unknown"
+    $DeliveryGroupName = "Unknown"
+    $SessionMachineRefNormalised = $null
+
+    if ($SessionMachineRefProperty) {
+        $SessionMachineRef = $Session.$SessionMachineRefProperty
+
+        if ($null -ne $SessionMachineRef) {
+            $SessionMachineRefNormalised = Convert-ToNormalisedReferenceString -Value $SessionMachineRef
+
+            if ($SessionMachineRefNormalised -and $MachineNameByReference.ContainsKey($SessionMachineRefNormalised)) {
+                $CleanVdaHostName = $MachineNameByReference[$SessionMachineRefNormalised]
+            }
+
+            if ($SessionMachineRefNormalised -and $MachineLookupByReference.ContainsKey($SessionMachineRefNormalised)) {
+                $MatchedMachine = $MachineLookupByReference[$SessionMachineRefNormalised]
+
+                if ($MachineNameProperty -and $MatchedMachine.$MachineNameProperty) {
+                    $VdaHostName = [string]$MatchedMachine.$MachineNameProperty
+                }
+                else {
+                    $VdaHostName = $CleanVdaHostName
                 }
             }
         }
     }
 
-    $TempResolvedList.Add([PSCustomObject]@{
-        User        = $AccountUser
-        LogonDate   = if ($Session.StartDate) { ([DateTime]$Session.StartDate).ToLocalTime().ToString("yyyy-MM-dd") } else { "Unknown" }
-        Group       = $DGName
-        SessionType = $SessionDetails
-        VdaHost     = $VdaHost
-        Cpu         = $SessionCpu
-        Mem         = $SessionMem
-        Status      = $LifecycleStr
-        LogonTime   = if ($Session.StartDate) { ([DateTime]$Session.StartDate).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown" }
+    if ($VdaHostName -eq "Unknown" -and $CleanVdaHostName -ne "unknown") {
+        $VdaHostName = $CleanVdaHostName
+    }
+
+    # Delivery Group resolution. This is inventory/location context only.
+    $DirectSessionGroupName = Get-ObjectPropertyValue `
+        -InputObject $Session `
+        -PropertyNames @("DesktopGroupName", "DeliveryGroupName", "GroupName", "PublishedDesktopName", "DesktopName")
+
+    if ($DirectSessionGroupName) {
+        $DeliveryGroupName = [string]$DirectSessionGroupName
+    }
+
+    if ($DeliveryGroupName -eq "Unknown" -and $SessionMachineRefNormalised) {
+        if ($MachineGroupNameByReference.ContainsKey($SessionMachineRefNormalised)) {
+            $DeliveryGroupName = $MachineGroupNameByReference[$SessionMachineRefNormalised]
+        }
+    }
+
+    if ($DeliveryGroupName -eq "Unknown" -and $MachineGroupNameByCleanName.ContainsKey($CleanVdaHostName)) {
+        $DeliveryGroupName = $MachineGroupNameByCleanName[$CleanVdaHostName]
+    }
+
+    if ($DeliveryGroupName -eq "Unknown") {
+        $RawSessionGroupRef = Get-ObjectPropertyValue `
+            -InputObject $Session `
+            -PropertyNames @(
+                "DesktopGroupId",
+                "DesktopGroupKey",
+                "DesktopGroupUid",
+                "DesktopGroupUId",
+                "DeliveryGroupId",
+                "DeliveryGroupKey",
+                "GroupId",
+                "GroupKey"
+            )
+
+        if ($RawSessionGroupRef) {
+            $GroupRefKey = Convert-ToNormalisedReferenceString -Value $RawSessionGroupRef
+
+            if ($GroupRefKey -and $GroupMap.ContainsKey($GroupRefKey)) {
+                $DeliveryGroupName = $GroupMap[$GroupRefKey]
+            }
+        }
+    }
+
+    if ($DeliveryGroupName -eq "Unknown" -and $SessionMachineRefNormalised) {
+        if ($MachineGroupReferenceByMachineReference.ContainsKey($SessionMachineRefNormalised)) {
+            $GroupRefKey = Convert-ToNormalisedReferenceString -Value $MachineGroupReferenceByMachineReference[$SessionMachineRefNormalised]
+
+            if ($GroupRefKey -and $GroupMap.ContainsKey($GroupRefKey)) {
+                $DeliveryGroupName = $GroupMap[$GroupRefKey]
+            }
+        }
+    }
+
+    if ($DeliveryGroupName -eq "Unknown" -and $BrokerFallbackMaps.MachineGroupNameByCleanName.ContainsKey($CleanVdaHostName)) {
+        $DeliveryGroupName = $BrokerFallbackMaps.MachineGroupNameByCleanName[$CleanVdaHostName]
+    }
+
+    $SessionStartDate = if ($SessionStartDateProperty) {
+        $Session.$SessionStartDateProperty
+    }
+    else {
+        $null
+    }
+
+    $SortableStartTime = $null
+    $LogonEpoch = $null
+
+    if ($SessionStartDate) {
+        try {
+            $SortableStartTime = [DateTime]$SessionStartDate
+            $UtcStart = $SortableStartTime.ToUniversalTime()
+            $LogonEpoch = [int64](([DateTimeOffset]$UtcStart).ToUnixTimeMilliseconds())
+        }
+        catch {
+            $SortableStartTime = $null
+            $LogonEpoch = $null
+        }
+    }
+
+    $SessionTypeValue = if ($SessionTypeProperty) {
+        $Session.$SessionTypeProperty
+    }
+    else {
+        $null
+    }
+
+    $IsDesktopSession = Test-IsDesktopSession -SessionTypeValue $SessionTypeValue
+    $IsApplicationSession = Test-IsApplicationSession -SessionTypeValue $SessionTypeValue
+    $SessionRefs = Get-SessionCandidateReferenceValues -Session $Session
+
+    $PublishedApplication = ""
+    $PublishedDesktop = ""
+    $ApplicationEvidenceSource = ""
+    $DesktopEvidenceSource = ""
+
+    $MachineKindText = $null
+
+    if ($MachineKindByCleanName.ContainsKey($CleanVdaHostName)) {
+        $MachineKindText = $MachineKindByCleanName[$CleanVdaHostName]
+    }
+
+    if ($BrokerFallbackMaps.MachineKindByCleanName.ContainsKey($CleanVdaHostName)) {
+        $MachineKindText = $BrokerFallbackMaps.MachineKindByCleanName[$CleanVdaHostName]
+    }
+
+    $MachineLooksLikeDesktop = Test-MachineLooksLikeDesktop `
+        -CleanMachineName $CleanVdaHostName `
+        -MachineKindText $MachineKindText
+
+    # -------------------------------------------------------------------------
+    # Published Application resolution - independent signal.
+    # Do not infer application from Delivery Group alone.
+    # -------------------------------------------------------------------------
+
+    $DirectApplicationName = Get-ObjectPropertyValue `
+        -InputObject $Session `
+        -PropertyNames @(
+            "PublishedApplicationName",
+            "ApplicationName",
+            "AppName",
+            "BrowserName",
+            "PublishedResourceName",
+            "ResourceName"
+        )
+
+    if ($DirectApplicationName) {
+        $PublishedApplication = [string]$DirectApplicationName
+        $ApplicationEvidenceSource = "SessionDirectApplicationName"
+    }
+
+    if ((Test-Blank $PublishedApplication) -and $SessionApplicationRefProperty) {
+        $AppId = $Session.$SessionApplicationRefProperty
+
+        if ($AppId) {
+            $AppKey = Convert-ToNormalisedReferenceString -Value $AppId
+
+            if ($AppKey -and $ApplicationLookupMap.ContainsKey($AppKey)) {
+                $PublishedApplication = $ApplicationLookupMap[$AppKey]
+                $ApplicationEvidenceSource = "SessionApplicationReference"
+            }
+        }
+    }
+
+    if (Test-Blank $PublishedApplication) {
+        foreach ($SessionRef in $SessionRefs) {
+            if ($SessionApplicationNameMap.ContainsKey($SessionRef)) {
+                $PublishedApplication = (($SessionApplicationNameMap[$SessionRef] | Sort-Object -Unique) -join ", ")
+                $ApplicationEvidenceSource = "ExactApplicationEvidenceReference"
+                break
+            }
+        }
+    }
+
+    if (Test-Blank $PublishedApplication) {
+        $EvidenceAppName = Resolve-ApplicationFromEvidence `
+            -SessionRefs $SessionRefs `
+            -SessionUserRef $SessionUserRefNormalised `
+            -SessionUserName $ResolvedUser `
+            -SessionMachineRef $SessionMachineRefNormalised `
+            -CleanVdaHostName $CleanVdaHostName `
+            -SessionStartTime $SortableStartTime `
+            -ApplicationEvidence @($ApplicationEvidenceRows)
+
+        if (-not (Test-Blank $EvidenceAppName)) {
+            $PublishedApplication = $EvidenceAppName
+            $ApplicationEvidenceSource = "CorrelatedApplicationEvidence"
+            $IsApplicationSession = $true
+        }
+    }
+
+    if (Test-Blank $PublishedApplication) {
+        $SingleFallbackApp = Resolve-SingleApplicationFallback `
+            -SessionUserRef $SessionUserRefNormalised `
+            -SessionUserName $ResolvedUser `
+            -ApplicationEvidence @($ApplicationEvidenceRows)
+
+        if (-not (Test-Blank $SingleFallbackApp)) {
+            $PublishedApplication = $SingleFallbackApp
+            $ApplicationEvidenceSource = "SingleUserApplicationEvidence"
+            $IsApplicationSession = $true
+        }
+    }
+
+    if (Test-Blank $PublishedApplication) {
+        $BrokerUserApp = Resolve-ApplicationFromBrokerUserFallback `
+            -SessionUserName $ResolvedUser `
+            -SessionUserRef $SessionUserRefNormalised `
+            -BrokerFallbackMaps $BrokerFallbackMaps
+
+        if (-not (Test-Blank $BrokerUserApp)) {
+            $PublishedApplication = $BrokerUserApp
+            $ApplicationEvidenceSource = "BrokerUserApplicationEntitlement"
+            $IsApplicationSession = $true
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # Published Desktop resolution - independent but controlled.
+    # -------------------------------------------------------------------------
+
+    $ResolvedDesktopName = ""
+    $HasDesktopEvidence = $false
+
+    $DirectDesktopName = Get-ObjectPropertyValue `
+        -InputObject $Session `
+        -PropertyNames @(
+            "PublishedDesktopName",
+            "PublishedDesktop",
+            "DesktopName"
+        )
+
+    if ($DirectDesktopName) {
+        $ResolvedDesktopName = [string]$DirectDesktopName
+        $HasDesktopEvidence = $true
+        $DesktopEvidenceSource = "SessionDirectDesktopName"
+    }
+
+    if (-not $HasDesktopEvidence -and $IsDesktopSession) {
+        $BrokerUserDesktop = Resolve-DesktopFromBrokerUserFallback `
+            -SessionUserName $ResolvedUser `
+            -SessionUserRef $SessionUserRefNormalised `
+            -BrokerFallbackMaps $BrokerFallbackMaps
+
+        if (-not (Test-Blank $BrokerUserDesktop)) {
+            $ResolvedDesktopName = $BrokerUserDesktop
+            $HasDesktopEvidence = $true
+            $DesktopEvidenceSource = "BrokerUserDesktopEntitlement"
+        }
+    }
+
+    # Controlled SessionType fallback.
+    # This restores Batman desktop rows where entitlement data is absent,
+    # while preventing app-only users from inheriting desktops when Broker proves app-only.
+    if (-not $HasDesktopEvidence -and $IsDesktopSession) {
+        $IsClearlyAppOnlyUser = Test-IsClearlyAppOnlyUser `
+            -SessionUserName $ResolvedUser `
+            -SessionUserRef $SessionUserRefNormalised `
+            -BrokerFallbackMaps $BrokerFallbackMaps
+
+        if (-not $IsClearlyAppOnlyUser) {
+            if (-not (Test-Blank $DeliveryGroupName) -and $DeliveryGroupName -ne "Unknown") {
+                $ResolvedDesktopName = $DeliveryGroupName
+            }
+            else {
+                $ResolvedDesktopName = "Published Desktop"
+            }
+
+            $HasDesktopEvidence = $true
+            $DesktopEvidenceSource = "SessionTypeControlledFallback"
+        }
+    }
+
+    if (-not $HasDesktopEvidence -and $IsDesktopSession -and $MachineLooksLikeDesktop) {
+        if (-not (Test-Blank $DeliveryGroupName) -and $DeliveryGroupName -ne "Unknown") {
+            $ResolvedDesktopName = $DeliveryGroupName
+        }
+        else {
+            $ResolvedDesktopName = "Published Desktop"
+        }
+
+        $HasDesktopEvidence = $true
+        $DesktopEvidenceSource = "DesktopSessionOnDesktopMachine"
+    }
+
+    if (-not $HasDesktopEvidence -and
+        (Test-Blank $PublishedApplication) -and
+        $MachineLooksLikeDesktop) {
+
+        if (-not (Test-Blank $DeliveryGroupName) -and $DeliveryGroupName -ne "Unknown") {
+            $ResolvedDesktopName = $DeliveryGroupName
+        }
+        else {
+            $ResolvedDesktopName = "Published Desktop"
+        }
+
+        $HasDesktopEvidence = $true
+        $DesktopEvidenceSource = "DesktopMachineFallback"
+    }
+
+    if ($HasDesktopEvidence) {
+        $PublishedDesktop = $ResolvedDesktopName
+    }
+    else {
+        $PublishedDesktop = ""
+    }
+
+    if ((Test-Blank $PublishedApplication) -and $IsApplicationSession -and -not $HasDesktopEvidence) {
+        $PublishedApplication = "Published Application"
+        $ApplicationEvidenceSource = "GenericApplicationSession"
+    }
+
+    $SessionCpu = "No Data"
+    $SessionMem = "No Data"
+
+    if ($PerformanceTelemetryMap.ContainsKey($CleanVdaHostName)) {
+        $Metric = $PerformanceTelemetryMap[$CleanVdaHostName]
+        $SessionCpu = Format-CpuMetric -Value $Metric.Cpu
+        $SessionMem = Format-MemoryMetric -Value $Metric.Mem -SourceProperty $Metric.MemoryProperty
+    }
+
+    $LocalLogonTime = "Unknown"
+
+    if ($SessionStartDate) {
+        try {
+            if ($null -eq $SortableStartTime) {
+                $SortableStartTime = [DateTime]$SessionStartDate
+            }
+
+            $LocalLogonTime = $SortableStartTime.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+        }
+        catch {
+            $LocalLogonTime = [string]$SessionStartDate
+        }
+    }
+
+    [void]$OutputRows.Add([PSCustomObject]@{
+        User                    = $ResolvedUser
+        "Delivery Group"        = $DeliveryGroupName
+        "Published Application" = $PublishedApplication
+        "Published Desktop"     = $PublishedDesktop
+        "VDA Host"              = $VdaHostName
+        CPU                     = $SessionCpu
+        MEM                     = $SessionMem
+        "Logon Time"            = $LocalLogonTime
+        LogonEpoch              = $LogonEpoch
+        SortableStartTime       = $SortableStartTime
+        ApplicationEvidence     = $ApplicationEvidenceSource
+        DesktopEvidence         = $DesktopEvidenceSource
     })
 }
 
+$SortedOutputRows = @(
+    $OutputRows |
+        Sort-Object User, SortableStartTime -Descending
+)
 
-# ==============================================================================
-# Script: Citrix Production Analytics Dashboard - Component Block 3 of 3
-# ==============================================================================
+$FinalExportRows = @(
+    $SortedOutputRows |
+        Select-Object `
+            User,
+            "Delivery Group",
+            "Published Application",
+            "Published Desktop",
+            "VDA Host",
+            CPU,
+            MEM,
+            "Logon Time"
+)
 
-# Convert array straight to a clean compressed text string block
-$JsonDataBlock = $TempResolvedList | ConvertTo-Json -Compress
+$DashboardRows = @(
+    $SortedOutputRows |
+        Select-Object `
+            User,
+            "Delivery Group",
+            "Published Application",
+            "Published Desktop",
+            "VDA Host",
+            CPU,
+            MEM,
+            "Logon Time",
+            LogonEpoch,
+            ApplicationEvidence,
+            DesktopEvidence
+)
 
-Write-Host "Compiling standalone production layout files..." -ForegroundColor Cyan
+#------------------------------------------------------------------------------
+# Archive Previous Reports
+#------------------------------------------------------------------------------
 
-# ARCHIVE MANAGEMENT: Move old variants safely clear of the workspace root path
-$ExistingFiles = Get-ChildItem -Path $TargetDirectory -Filter "Citrix_60Day_Director_Dashboard_*.html" -File
-foreach ($File in $ExistingFiles) {
-    $DestinationPath = Join-Path $ArchiveDirectory $File.Name
-    try {
-        Move-Item -Path $File.FullName -Destination $DestinationPath -Force -ErrorAction Stop
-        Write-Host "Archived previous report file version to: $DestinationPath" -ForegroundColor Yellow
-    } catch {
-        Write-Warning "Could not archive file '$($File.Name)': $($_.Exception.Message)"
+Write-Section "Archiving Previous Report Files"
+
+Get-ChildItem -Path $TargetDirectory -Filter "Citrix_Director_Historical_Dashboard_*.html" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $OutputHtmlFile } |
+    ForEach-Object {
+        try {
+            Move-Item -Path $_.FullName -Destination (Join-Path $ArchiveDirectory $_.Name) -Force
+        }
+        catch {
+            Write-Warning "Unable to archive HTML file '$($_.FullName)'. $($_.Exception.Message)"
+        }
     }
+
+Get-ChildItem -Path $TargetDirectory -Filter "Citrix_Director_Historical_Dashboard_*.csv" -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -ne $OutputCsvFile } |
+    ForEach-Object {
+        try {
+            Move-Item -Path $_.FullName -Destination (Join-Path $ArchiveDirectory $_.Name) -Force
+        }
+        catch {
+            Write-Warning "Unable to archive CSV file '$($_.FullName)'. $($_.Exception.Message)"
+        }
+    }
+
+#------------------------------------------------------------------------------
+# CSV Output
+#------------------------------------------------------------------------------
+
+Write-Section "Writing CSV Output"
+
+$FinalExportRows |
+    Export-Csv `
+        -Path $OutputCsvFile `
+        -NoTypeInformation `
+        -Encoding UTF8 `
+        -Force
+
+Write-Host "CSV written to: $OutputCsvFile" -ForegroundColor Green
+
+#------------------------------------------------------------------------------
+# HTML Dashboard Output
+#------------------------------------------------------------------------------
+
+Write-Section "Writing HTML Dashboard"
+
+$JsonDataBlock = @($DashboardRows) |
+    ConvertTo-Json `
+        -Compress `
+        -Depth 8
+
+$JsonDataBlock = $JsonDataBlock -replace '</script>', '<\/script>'
+
+$DiscoverySummary = [PSCustomObject]@{
+    ControllerAddress          = $ControllerAddress
+    BaseUrl                    = $BaseUrl
+    LookbackDays               = $LookbackDays
+    UserEntitySet              = if ($UserEntity) { $UserEntity.EntitySetName } else { "" }
+    MachineEntitySet           = if ($MachineEntity) { $MachineEntity.EntitySetName } else { "" }
+    DeliveryGroupEntitySet     = if ($GroupEntity) { $GroupEntity.EntitySetName } else { "" }
+    ApplicationEntitySet       = if ($ApplicationEntity) { $ApplicationEntity.EntitySetName } else { "" }
+    SessionEntitySet           = if ($SessionEntity) { $SessionEntity.EntitySetName } else { "" }
+    ApplicationUsageEntitySets = (($ApplicationUsageEntities | Select-Object -ExpandProperty EntitySetName) -join ", ")
+    MetricEntitySets           = (($MetricEntities | Select-Object -ExpandProperty EntitySetName) -join ", ")
+    GeneratedOn                = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    CsvOutput                  = $OutputCsvFile
 }
 
-# Define the HTML Layout Header
-$HtmlHeader = @'
+$DiscoveryJsonBlock = $DiscoverySummary |
+    ConvertTo-Json `
+        -Compress `
+        -Depth 5
+
+$DiscoveryJsonBlock = $DiscoveryJsonBlock -replace '</script>', '<\/script>'
+
+$HtmlHeader = @"
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Citrix Production Analytics Report</title>
+    <meta charset="UTF-8">
+    <title>Citrix Director Historical Analytics Dashboard</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 30px; color: #333; }
-        h2 { color: #0288d1; border-bottom: 2px solid #0288d1; padding-bottom: 10px; margin-bottom: 5px; }
-        .timestamp { font-size: 0.9em; color: #666; margin-bottom: 25px; }
-        .action-bar { display: flex; gap: 15px; margin-bottom: 20px; }
-        .search-box { flex-grow: 1; padding: 12px; box-sizing: border-box; font-size: 1em; border: 1px solid #ccc; border-radius: 4px; }
-        .btn-export { background-color: #2e7d32; color: white; border: none; padding: 0 20px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.95em; transition: background 0.2s; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #f4f6f9; margin: 30px; color: #333; }
+        h2 { color: #0288d1; border-bottom: 2px solid #0288d1; padding-bottom: 12px; margin-bottom: 5px; }
+        .timestamp { font-size: 0.92em; color: #666; margin-bottom: 10px; }
+        .summary-panel { background: #fff; border: 1px solid #dee2e6; border-left: 4px solid #0288d1; border-radius: 4px; padding: 14px 18px; margin-bottom: 20px; font-size: 13px; color: #495057; }
+        .summary-panel code { background: #f1f3f5; padding: 2px 5px; border-radius: 3px; }
+        .action-bar { display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }
+        .search-box { flex-grow: 1; min-width: 420px; padding: 12px 16px; font-size: 15px; border: 1px solid #ccc; border-radius: 4px; outline: none; }
+        .search-box:focus { border-color: #0288d1; box-shadow: 0 0 0 2px rgba(2,136,209,0.15); }
+        .range-select { padding: 12px 16px; font-size: 14px; border: 1px solid #ccc; border-radius: 4px; background: #fff; }
+        .btn-export { background-color: #2e7d32; color: white; border: none; padding: 0 24px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 14px; text-transform: uppercase; min-height: 44px; }
         .btn-export:hover { background-color: #1b5e20; }
-        .user-container { background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 5px; margin-bottom: 15px; overflow: hidden; }
-        details.user-dropdown > summary { padding: 15px; font-size: 1.1em; font-weight: bold; background-color: #0288d1; color: white; cursor: pointer; display: flex; justify-content: space-between; align-items: center; outline: none; }
-        details.user-dropdown > summary::after { content: '➔'; transition: transform 0.2s ease; font-size: 0.8em; }
-        details.user-dropdown[open] > summary::after { transform: rotate(90deg); }
-        .user-content { padding: 15px; background-color: #fafafa; }
-        details.date-dropdown { margin-bottom: 10px; border-left: 4px solid #0288d1; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-        details.date-dropdown > summary { padding: 10px 15px; font-weight: 600; color: #333; background-color: #eee; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-        details.date-dropdown > summary::after { content: '▼'; font-size: 0.8em; color: #666; }
-        .table-container { padding: 10px; background: #fff; }
-        table { border-collapse: collapse; width: 100%; margin-top: 5px; background: #fff; }
-        th { background-color: #555; color: white; text-align: left; padding: 10px; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; }
-        td { padding: 10px; border-bottom: 1px solid #ddd; vertical-align: top; font-size: 0.9em; }
-        tr:hover { background-color: #f9f9f9; }
-        .status-active { color: #2e7d32; font-weight: bold; background: #e8f5e9; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
-        .status-disconnected { color: #c62828; font-weight: bold; background: #ffebee; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
-        .status-ended { color: #757575; font-style: italic; background: #f5f5f5; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
+        .user-container { background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.08); border-radius: 4px; margin-bottom: 15px; overflow: hidden; border: 1px solid #dee2e6; }
+        details.user-dropdown > summary { padding: 16px 20px; font-size: 17px; font-weight: bold; background-color: #0081c7; color: white; cursor: pointer; display: grid; grid-template-columns: 1fr 260px 30px; align-items: center; outline: none; list-style: none; }
+        details.user-dropdown > summary::-webkit-details-marker { display: none; }
+        .row-count-col { text-align: left; font-size: 15px; }
+        .arrow-col { text-align: right; font-size: 11px; color: #fff; transition: transform 0.2s ease; }
+        details.user-dropdown[open] > summary .arrow-col { transform: rotate(180deg); }
+        .user-content { padding: 20px; background-color: #f8f9fa; }
+        .table-container { padding: 12px 20px 20px 20px; background: #fff; overflow-x: auto; }
+        table { border-collapse: collapse; width: 100%; margin-top: 5px; background: #fff; min-width: 1100px; }
+        th { background-color: #495057; color: white; text-align: left; padding: 12px; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.6px; border-bottom: 2px solid #dee2e6; }
+        td { padding: 12px; border-bottom: 1px solid #dee2e6; vertical-align: middle; font-size: 13px; color: #495057; }
+        tr:hover { background-color: #f8f9fa; }
+        code { background-color: #f1f3f5; padding: 2px 5px; border-radius: 3px; color: #c7254e; }
+        .empty-cell { color: #999; font-style: italic; }
+        .filter-caption { font-size: 13px; color: #666; align-self: center; }
     </style>
 </head>
 <body>
     <h2>Citrix Director Historical Analytics Dashboard</h2>
-    <div class="timestamp">Lookback Window: Active past 60 Days (Production Release Optimized)</div>
-    
+    <div class="timestamp">Loaded Lookback Window: Past $LookbackDays Days | Generated: $((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))</div>
+
+    <div class="summary-panel" id="summaryPanel"></div>
+
     <div class="action-bar">
-        <input type="text" id="search" class="search-box" placeholder="Filter by User Name..." onkeyup="filterUsers()">
-        <button class="btn-export" onclick="exportToCSV()">Export All to CSV</button>
+        <input type="text" id="search" class="search-box" placeholder="Filter by user, delivery group, application, desktop or VDA host..." onkeyup="renderDashboard()">
+        <select id="rangeFilter" class="range-select" onchange="renderDashboard()">
+            <option value="1">Last 1 day</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60" selected>Last 60 days</option>
+            <option value="all">All loaded data</option>
+        </select>
+        <button class="btn-export" onclick="exportToCSV()">Export View to CSV</button>
+        <span class="filter-caption" id="viewCaption"></span>
     </div>
-    
+
     <div id="dashboard">Loading data segments...</div>
 
     <script>
-        function renderDashboard(data) {
-            let groups = {};
-            data.forEach(item => {
-                if (!groups[item.User]) groups[item.User] = {};
-                if (!groups[item.User][item.LogonDate]) groups[item.User][item.LogonDate] = [];
-                groups[item.User][item.LogonDate].push(item);
-            });
+        const discoverySummary =
+"@
 
-            let container = document.getElementById('dashboard');
-            container.innerHTML = '';
+$HtmlMiddle = @"
+;
+        let sessionData =
+"@
 
-            Object.keys(groups).sort().forEach(user => {
-                let userDates = groups[user];
-                let totalLogons = 0;
-                Object.keys(userDates).forEach(d => totalLogons += userDates[d].length);
+$HtmlFooter = @"
+;
 
-                let userBox = document.createElement('div');
-                userBox.className = 'user-container';
-                
-                let html = `<details class='user-dropdown'><summary><span>User: ${user}</span><span>Total Logons: ${totalLogons}</span></summary><div class='user-content'>`;
-                
-                Object.keys(userDates).sort().reverse().forEach(date => {
-                    let sessions = userDates[date];
-                    html += `<details class='date-dropdown'><summary><span>Date: ${date}</span><span>(${sessions.length} Session(s))</span></summary><div class='table-container'>`;
-                    html += `<table><thead><tr><th>DELIVERY GROUP</th><th>SESSION TYPE / APPS</th><th>VDA MACHINE HOST</th><th>RESOURCE METRICS</th><th>LIFECYCLE STATE</th><th>LOGON START TIME</th></tr></thead><tbody>`;
-                    
-                    sessions.forEach(s => {
-                        let badge = s.Status === 'Active' ? 'status-active' : (s.Status === 'Ended' ? 'status-ended' : 'status-disconnected');
-                        let perfMetrics = `Avg CPU: ${s.Cpu} | Avg Memory: ${s.Mem}`;
-                        html += `<tr><td>${s.Group}</td><td>${s.SessionType}</td><td>${s.VdaHost}</td><td>${perfMetrics}</td><td><span class='${badge}'>${s.Status}</span></td><td>${s.LogonTime}</td></tr>`;
-                    });
-                    
-                    html += `</tbody></table></div></details>`;
+        if (!Array.isArray(sessionData)) {
+            sessionData = sessionData ? [sessionData] : [];
+        }
+
+        function escapeHtml(value) {
+            if (value === null || value === undefined || value === '') {
+                return '<span class="empty-cell">blank</span>';
+            }
+
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function rawCsvValue(value) {
+            if (value === null || value === undefined) {
+                return '';
+            }
+
+            return String(value).replace(/"/g, '""');
+        }
+
+        function renderSummary() {
+            const panel = document.getElementById('summaryPanel');
+
+            panel.innerHTML =
+                '<strong>Discovered Monitor OData entity sets:</strong><br>' +
+                'Users: <code>' + escapeHtml(discoverySummary.UserEntitySet) + '</code> | ' +
+                'Machines: <code>' + escapeHtml(discoverySummary.MachineEntitySet) + '</code> | ' +
+                'Delivery Groups: <code>' + escapeHtml(discoverySummary.DeliveryGroupEntitySet) + '</code> | ' +
+                'Applications: <code>' + escapeHtml(discoverySummary.ApplicationEntitySet) + '</code> | ' +
+                'Sessions: <code>' + escapeHtml(discoverySummary.SessionEntitySet) + '</code><br>' +
+                'Application usage/evidence: <code>' + escapeHtml(discoverySummary.ApplicationUsageEntitySets) + '</code><br>' +
+                'Metrics: <code>' + escapeHtml(discoverySummary.MetricEntitySets) + '</code><br>' +
+                'CSV file written by PowerShell: <code>' + escapeHtml(discoverySummary.CsvOutput) + '</code>';
+        }
+
+        function getFilteredData() {
+            const filter = document.getElementById('search').value.toLowerCase();
+            const rangeValue = document.getElementById('rangeFilter').value;
+            const now = Date.now();
+
+            return sessionData.filter(row => {
+                const textMatch = !filter || Object.keys(row).some(key => {
+                    return String(row[key] || '').toLowerCase().includes(filter);
                 });
 
-                html += `</div></details>`;
+                if (!textMatch) {
+                    return false;
+                }
+
+                if (rangeValue === 'all') {
+                    return true;
+                }
+
+                if (!row.LogonEpoch) {
+                    return false;
+                }
+
+                const days = Number(rangeValue);
+                const since = now - (days * 24 * 60 * 60 * 1000);
+
+                return Number(row.LogonEpoch) >= since;
+            });
+        }
+
+        function renderDashboard() {
+            const data = getFilteredData();
+            const groups = {};
+
+            data.forEach(item => {
+                const user = item.User || 'System Account / Unresolved';
+
+                if (!groups[user]) {
+                    groups[user] = [];
+                }
+
+                groups[user].push(item);
+            });
+
+            const caption = document.getElementById('viewCaption');
+            const rangeText = document.getElementById('rangeFilter').selectedOptions[0].text;
+            caption.textContent = 'Showing ' + data.length + ' session row(s) for ' + rangeText + '.';
+
+            const container = document.getElementById('dashboard');
+            container.innerHTML = '';
+
+            const userNames = Object.keys(groups).sort();
+
+            if (userNames.length === 0) {
+                container.innerHTML = '<div class="summary-panel">No matching records found.</div>';
+                return;
+            }
+
+            userNames.forEach(user => {
+                const rows = groups[user];
+
+                const userBox = document.createElement('div');
+                userBox.className = 'user-container';
+
+                let html = '';
+                html += '<details class="user-dropdown">';
+                html += '<summary>';
+                html += '<span>User: ' + escapeHtml(user) + '</span>';
+                html += '<span class="row-count-col">Total Sessions: ' + rows.length + '</span>';
+                html += '<span class="arrow-col">▼</span>';
+                html += '</summary>';
+                html += '<div class="user-content">';
+                html += '<div class="table-container">';
+                html += '<table>';
+                html += '<thead>';
+                html += '<tr>';
+                html += '<th>User</th>';
+                html += '<th>Delivery Group</th>';
+                html += '<th>Published Application</th>';
+                html += '<th>Published Desktop</th>';
+                html += '<th>VDA Host</th>';
+                html += '<th>CPU</th>';
+                html += '<th>MEM</th>';
+                html += '<th>Logon Time</th>';
+                html += '</tr>';
+                html += '</thead>';
+                html += '<tbody>';
+
+                rows.forEach(row => {
+                    html += '<tr>';
+                    html += '<td>' + escapeHtml(row.User) + '</td>';
+                    html += '<td><strong>' + escapeHtml(row['Delivery Group']) + '</strong></td>';
+                    html += '<td>' + escapeHtml(row['Published Application']) + '</td>';
+                    html += '<td>' + escapeHtml(row['Published Desktop']) + '</td>';
+                    html += '<td><code>' + escapeHtml(row['VDA Host']) + '</code></td>';
+                    html += '<td>' + escapeHtml(row.CPU) + '</td>';
+                    html += '<td>' + escapeHtml(row.MEM) + '</td>';
+                    html += '<td>' + escapeHtml(row['Logon Time']) + '</td>';
+                    html += '</tr>';
+                });
+
+                html += '</tbody>';
+                html += '</table>';
+                html += '</div>';
+                html += '</div>';
+                html += '</details>';
+
                 userBox.innerHTML = html;
                 container.appendChild(userBox);
             });
         }
 
-        function filterUsers() {
-            let filter = document.getElementById('search').value.toLowerCase();
-            let cards = document.getElementsByClassName('user-container');
-            for (let card of cards) {
-                let name = card.querySelector('summary span').textContent.toLowerCase();
-                card.style.display = name.includes(filter) ? '' : 'none';
-            }
-        }
-
         function exportToCSV() {
-            if (!sessionData || sessionData.length === 0) return alert('No data available to export.');
-            let headers = ['User', 'Logon Date', 'Delivery Group', 'Session Type / Apps', 'VDA Host', 'Resource Metrics', 'Status', 'Logon Time'];
-            let csvRows = [headers.join(',')];
-            
-            sessionData.forEach(row => {
-                let perfStr = `Avg CPU: ${row.Cpu} | Avg Memory: ${row.Mem}`;
-                let values = [
-                    `"${row.User}"`,
-                    `"${row.LogonDate}"`,
-                    `"${row.Group}"`,
-                    `"${row.SessionType.replace(/"/g, '""')}"`,
-                    `"${row.VdaHost}"`,
-                    `"${perfStr.replace(/"/g, '""')}"`,
-                    `"${row.Status}"`,
-                    `"${row.LogonTime}"`
-                ];
-                csvRows.push(values.join(','));
+            const data = getFilteredData();
+
+            if (!data || data.length === 0) {
+                alert('No data available to export.');
+                return;
+            }
+
+            const headers = [
+                'User',
+                'Delivery Group',
+                'Published Application',
+                'Published Desktop',
+                'VDA Host',
+                'CPU',
+                'MEM',
+                'Logon Time'
+            ];
+
+            const csvRows = [headers.join(',')];
+
+            data.forEach(row => {
+                csvRows.push([
+                    '"' + rawCsvValue(row.User) + '"',
+                    '"' + rawCsvValue(row['Delivery Group']) + '"',
+                    '"' + rawCsvValue(row['Published Application']) + '"',
+                    '"' + rawCsvValue(row['Published Desktop']) + '"',
+                    '"' + rawCsvValue(row['VDA Host']) + '"',
+                    '"' + rawCsvValue(row.CPU) + '"',
+                    '"' + rawCsvValue(row.MEM) + '"',
+                    '"' + rawCsvValue(row['Logon Time']) + '"'
+                ].join(','));
             });
-            
-            let blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
-            let link = document.createElement('a');
+
+            const blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+
             link.href = URL.createObjectURL(blob);
-            link.setAttribute('download', 'Citrix_Historical_Sessions_Report.csv');
+            link.setAttribute('download', 'Citrix_Historical_Sessions_Filtered_View.csv');
+
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
         }
 
-        const sessionData = 
-'@
-
-# Set up the Closing JavaScript block
-$HtmlFooter = @'
-;
-        renderDashboard(sessionData);
+        renderSummary();
+        renderDashboard();
     </script>
 </body>
 </html>
-'@
+"@
 
-# Stream out components sequentially to guarantee execution safety without buffer loops
-$HtmlHeader | Out-File -FilePath $OutputFile -Encoding utf8 -Force
-Add-Content -Path $OutputFile -Value $JsonDataBlock -Encoding utf8
-Add-Content -Path $OutputFile -Value $HtmlFooter -Encoding utf8
+$HtmlHeader | Out-File -FilePath $OutputHtmlFile -Encoding UTF8 -Force
+Add-Content -Path $OutputHtmlFile -Value $DiscoveryJsonBlock -Encoding UTF8
+Add-Content -Path $OutputHtmlFile -Value $HtmlMiddle -Encoding UTF8
+Add-Content -Path $OutputHtmlFile -Value $JsonDataBlock -Encoding UTF8
+Add-Content -Path $OutputHtmlFile -Value $HtmlFooter -Encoding UTF8
 
-Write-Host "Success! Dashboard written smoothly to timestamped path at: $OutputFile" -ForegroundColor Green
+Write-Host "HTML dashboard written to: $OutputHtmlFile" -ForegroundColor Green
+
+#------------------------------------------------------------------------------
+# Completion
+#------------------------------------------------------------------------------
+
+Write-Section "Completed"
+
+Write-Host "Success. Dashboard and CSV were generated." -ForegroundColor Green
+Write-Host "HTML: $OutputHtmlFile" -ForegroundColor Green
+Write-Host "CSV : $OutputCsvFile" -ForegroundColor Green
+Write-Host "Log : $LogFile" -ForegroundColor Green
+
+try {
+    Stop-Transcript | Out-Null
+}
+catch {
+    # Ignore transcript stop failures.
+}
+
+# Script: Citrix Production Analytics Dashboard Compiler
