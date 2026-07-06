@@ -1,0 +1,1223 @@
+<#
+.SYNOPSIS
+    Export Citrix CVAD Site configuration to structured XML.
+
+.DESCRIPTION
+    Exports selected CVAD site configuration elements to a custom XML file
+    and exports published application icon data to a resources folder.
+
+    Target output:
+        C:\Temp\Reports\ctx_export.xml
+        C:\Temp\Reports\resources\
+
+    Exported elements:
+        - Site Properties
+        - Tags
+        - Administrators, Roles and Scopes
+        - Machine Catalogs
+        - Provisioning Schemes
+        - Identity Pools
+        - Delivery Groups
+        - Power Management Rules
+        - Reboot Schedules
+        - Published Applications
+        - Published Application Icons
+        - File Type Associations
+        - Citrix Policies
+
+.NOTES
+    Author: Miral Mehta / Framework Skeleton
+    Target: CVAD 1912 LTSR through current releases where compatible SDK cmdlets exist.
+    Output: Custom CLIXML object model, not native Citrix ACT YAML.
+
+    This is an export framework skeleton. Some environments may require local
+    extension depending on:
+        - MCS / PVS usage
+        - Citrix Cloud vs on-prem
+        - SDK version
+        - Policy set model
+        - Application Group usage
+        - Multi-zone topology
+
+Author: M Mehta with help from Co-Pilot
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$AdminAddress = "localhost",
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFolder = "C:\Temp\Reports",
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputXmlName = "ctx_export.xml",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ResourcesFolderName = "resources",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeNativeConfigXml,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludePolicyBinaryExport,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$VerboseLogging
+)
+
+# =============================================================================
+# 0. Initialisation
+# =============================================================================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+$Script:OutputXmlPath     = Join-Path $OutputFolder $OutputXmlName
+$Script:ResourcesFolder   = Join-Path $OutputFolder $ResourcesFolderName
+$Script:NativeConfigPath  = Join-Path $OutputFolder "ctx_native_config.xml"
+$schedules = $null
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Warning", "Error", "Success", "Debug")]
+        [string]$Level = "Info"
+    )
+
+    $colour = switch ($Level) {
+        "Info"    { "Cyan" }
+        "Warning" { "Yellow" }
+        "Error"   { "Red" }
+        "Success" { "Green" }
+        "Debug"   { "DarkGray" }
+    }
+
+    if ($Level -ne "Debug" -or $VerboseLogging) {
+        Write-Host "[$Level] $Message" -ForegroundColor $colour
+    }
+}
+
+function Ensure-Folder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -ItemType Directory -Path $Path -Force)
+    }
+}
+
+function Import-CitrixSdk {
+    <#
+        Loads Citrix snap-ins/modules in a tolerant way.
+        Different CVAD versions may expose snap-ins/modules differently.
+    #>
+
+    Write-Log "Loading Citrix PowerShell SDK..." "Info"
+
+    try {
+        Add-PSSnapin Citrix* -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Citrix snap-ins were not loaded via Add-PSSnapin. Continuing to module check." "Debug"
+    }
+
+    try {
+        Import-Module Citrix.* -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Citrix modules were not loaded via Import-Module. Continuing." "Debug"
+    }
+
+    $requiredCmdlets = @(
+        "Get-BrokerSite",
+        "Get-BrokerApplication",
+        "Get-BrokerDesktopGroup",
+        "Get-BrokerCatalog"
+    )
+
+    foreach ($cmdlet in $requiredCmdlets) {
+        if (-not (Get-Command $cmdlet -ErrorAction SilentlyContinue)) {
+            throw "Required Citrix SDK cmdlet not found: $cmdlet. Install the Citrix PowerShell SDK / Studio components."
+        }
+    }
+
+    Write-Log "Citrix PowerShell SDK loaded successfully." "Success"
+}
+
+function Get-SafeProperty {
+    <#
+        Defensive property accessor to avoid breaking across CVAD versions.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName,
+
+        [Parameter(Mandatory = $false)]
+        [object]$DefaultValue = $null
+    )
+
+    if ($null -eq $InputObject) {
+        return $DefaultValue
+    }
+
+    $property = $InputObject.PSObject.Properties[$PropertyName]
+
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Convert-ToExportSafeObject {
+    <#
+        Converts a PowerShell object into a simpler property bag.
+        This avoids serialising overly complex SDK object internals.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$PropertyNames
+    )
+
+    $hash = [ordered]@{}
+
+    foreach ($propertyName in $PropertyNames) {
+        $hash[$propertyName] = Get-SafeProperty -InputObject $InputObject -PropertyName $propertyName
+    }
+
+    [pscustomobject]$hash
+}
+
+function Convert-ToSafeFileName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $invalidChars = [IO.Path]::GetInvalidFileNameChars()
+    $safeName = $Name
+
+    foreach ($char in $invalidChars) {
+        $safeName = $safeName.Replace($char, "_")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($safeName)) {
+        $safeName = [guid]::NewGuid().ToString()
+    }
+
+    return $safeName
+}
+
+# =============================================================================
+# 1. Site-Level Collector
+# =============================================================================
+
+function Export-CtxSiteProperties {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting site properties..." "Info"
+
+    $site = Get-BrokerSite -AdminAddress $AdminAddress
+
+    $properties = @(
+        "Name",
+        "Uid",
+        "LicenseServerName",
+        "LicenseServerPort",
+        "LicensingModel",
+        "ProductCode",
+        "ProductEdition",
+        "MinimumFunctionalLevel",
+        "DNSResolutionEnabled",
+        "TrustRequestsSentToTheXmlServicePort",
+        "LocalHostCacheEnabled",
+        "ConfigLastChangeTime"
+    )
+
+    Convert-ToExportSafeObject -InputObject $site -PropertyNames $properties
+}
+
+function Export-CtxNativeConfigurationXml {
+    param(
+        [string]$AdminAddress,
+        [string]$Path
+    )
+
+    if (-not (Get-Command Export-ConfigConfiguration -ErrorAction SilentlyContinue)) {
+        Write-Log "Export-ConfigConfiguration cmdlet not found. Skipping native config XML export." "Warning"
+        return $null
+    }
+
+    Write-Log "Exporting native Citrix site configuration XML..." "Info"
+
+    try {
+        $nativeXml = Export-ConfigConfiguration -AdminAddress $AdminAddress
+        $nativeXml | Out-File -FilePath $Path -Encoding UTF8 -Force
+
+        [pscustomobject]@{
+            Exported = $true
+            Path     = $Path
+        }
+    }
+    catch {
+        Write-Log "Native configuration XML export failed: $($_.Exception.Message)" "Warning"
+
+        [pscustomobject]@{
+            Exported = $false
+            Path     = $Path
+            Error    = $_.Exception.Message
+        }
+    }
+}
+
+# =============================================================================
+# 2. Tags Collector
+# =============================================================================
+
+function Export-CtxTags {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting tags..." "Info"
+
+    if (-not (Get-Command Get-BrokerTag -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerTag not found. Skipping tags." "Warning"
+        return @()
+    }
+
+    $tags = Get-BrokerTag -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($tag in $tags) {
+        Convert-ToExportSafeObject -InputObject $tag -PropertyNames @(
+            "Name",
+            "Uid",
+            "Description",
+            "MetadataMap",
+            "UUID"
+        )
+    }
+}
+
+# =============================================================================
+# 3. Delegated Administration Collector
+# =============================================================================
+
+function Export-CtxAdministrators {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting administrators, roles and scopes..." "Info"
+
+   $adminExport = [ordered]@{
+    Administrators = @()
+    Roles          = @()
+    Scopes         = @()
+    Rights         = @()
+    }
+
+    if (Get-Command Get-AdminAdministrator -ErrorAction SilentlyContinue) {
+        $admins = Get-AdminAdministrator -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+        $adminExport.Administrators = foreach ($admin in $admins) {
+
+
+        Convert-ToExportSafeObject -InputObject $admin -PropertyNames @(
+            "Name",
+            "DisplayName",
+            "Sid",
+            "Enabled",
+            "IsGroup",
+            "Id",
+            "Uid"
+        )
+
+    }
+ }
+    
+    else {
+        Write-Log "Get-AdminAdministrator not found. Skipping administrator export." "Warning"
+    }
+
+    if (Get-Command Get-AdminRole -ErrorAction SilentlyContinue) {
+        $roles = Get-AdminRole -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+        $adminExport.Roles = foreach ($role in $roles) {
+            Convert-ToExportSafeObject -InputObject $role -PropertyNames @(
+                "Name",
+                "Description",
+                "Id",
+                "IsBuiltIn",
+                "Uid"
+            )
+        }
+    }
+    else {
+        Write-Log "Get-AdminRole not found. Skipping role export." "Warning"
+    }
+
+    if (Get-Command Get-AdminScope -ErrorAction SilentlyContinue) {
+        $scopes = Get-AdminScope -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+        $adminExport.Scopes = foreach ($scope in $scopes) {
+            Convert-ToExportSafeObject -InputObject $scope -PropertyNames @(
+                "Name",
+                "Description",
+                "Id",
+                "IsBuiltIn",
+                "Uid"
+            )
+        }
+    }
+    else {
+        Write-Log "Get-AdminScope not found. Skipping scope export." "Warning"
+    }
+
+    if (Get-Command Get-AdminRight -ErrorAction SilentlyContinue) {
+        $rights = Get-AdminRight -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+        $adminExport.Rights = foreach ($right in $rights) {
+            Convert-ToExportSafeObject -InputObject $right -PropertyNames @(
+                "Administrator",
+                "Role",
+                "Scope",
+                "Id",
+                "Uid"
+            )
+        }
+    }
+    else {
+        Write-Log "Get-AdminRight not found. Skipping admin rights mapping." "Warning"
+    }
+
+    [pscustomobject]$adminExport
+}
+
+# =============================================================================
+# 4. Catalog, Provisioning Scheme and Identity Pool Collectors
+# =============================================================================
+
+function Export-CtxCatalogs {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting machine catalogs..." "Info"
+
+    $catalogs = Get-BrokerCatalog -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($catalog in $catalogs) {
+        Convert-ToExportSafeObject -InputObject $catalog -PropertyNames @(
+            "Name",
+            "Uid",
+            "UUID",
+            "Description",
+            "AllocationType",
+            "AssignedCount",
+            "AvailableAssignedCount",
+            "AvailableCount",
+            "CatalogKind",
+            "CatalogType",
+            "DeliveryType",
+            "IsRemotePC",
+            "MachinesArePhysical",
+            "MinimumFunctionalLevel",
+            "PersistUserChanges",
+            "ProvisioningType",
+            "SessionSupport",
+            "ZoneName",
+            "ZoneUid",
+            "MetadataMap"
+        )
+    }
+}
+
+function Export-CtxProvisioningSchemes {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting MCS provisioning schemes..." "Info"
+
+    if (-not (Get-Command Get-ProvScheme -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-ProvScheme not found. Skipping provisioning schemes." "Warning"
+        return @()
+    }
+
+    $schemes = Get-ProvScheme -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($scheme in $schemes) {
+        Convert-ToExportSafeObject -InputObject $scheme -PropertyNames @(
+            "ProvisioningSchemeName",
+            "ProvisioningSchemeUid",
+            "IdentityPoolUid",
+            "HostingUnitUid",
+            "MasterImageVM",
+            "CleanOnBoot",
+            "UsePersonalVDiskStorage",
+            "UseWriteBackCache",
+            "WriteBackCacheDiskSize",
+            "WriteBackCacheMemorySize",
+            "MachineProfile",
+            "CustomProperties",
+            "Metadata"
+        )
+    }
+}
+
+function Export-CtxIdentityPools {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting identity pools..." "Info"
+
+    if (-not (Get-Command Get-AcctIdentityPool -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-AcctIdentityPool not found. Skipping identity pools." "Warning"
+        return @()
+    }
+
+    $pools = Get-AcctIdentityPool -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($pool in $pools) {
+        Convert-ToExportSafeObject -InputObject $pool -PropertyNames @(
+            "IdentityPoolName",
+            "IdentityPoolUid",
+            "NamingScheme",
+            "NamingSchemeType",
+            "Domain",
+            "OU",
+            "DeviceManagementType",
+            "WorkGroupMachine",
+            "MetadataMap"
+        )
+    }
+}
+
+# =============================================================================
+# 5. Delivery Group Collector
+# =============================================================================
+
+function Export-CtxDeliveryGroups {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting delivery groups..." "Info"
+
+    $groups = Get-BrokerDesktopGroup -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($group in $groups) {
+        Convert-ToExportSafeObject -InputObject $group -PropertyNames @(
+            "Name",
+            "Uid",
+            "UUID",
+            "Description",
+            "DesktopKind",
+            "DeliveryType",
+            "SessionSupport",
+            "Enabled",
+            "InMaintenanceMode",
+            "MinimumFunctionalLevel",
+            "ColorDepth",
+            "SecureIcaRequired",
+            "ShutdownDesktopsAfterUse",
+            "TimeZone",
+            "ZoneName",
+            "ZoneUid",
+            "PublishedName",
+            "MetadataMap",
+            "Tags"
+        )
+    }
+}
+
+function Export-CtxPowerManagement {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting power management rules..." "Info"
+
+    $powerExport = [ordered]@{
+        PowerTimeSchemes = @()
+        PowerActions     = @()
+    }
+
+    if (Get-Command Get-BrokerPowerTimeScheme -ErrorAction SilentlyContinue) {
+        $schemes = Get-BrokerPowerTimeScheme -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+        $powerExport.PowerTimeSchemes = foreach ($scheme in $schemes) {
+            Convert-ToExportSafeObject -InputObject $scheme -PropertyNames @(
+                "Name",
+                "Uid",
+                "DesktopGroupUid",
+                "DaysOfWeek",
+                "DisplayName",
+                "PeakHours",
+                "PoolSize",
+                "PoolUsingPercentage",
+                "PowerPolicy"
+            )
+        }
+    }
+    else {
+        Write-Log "Get-BrokerPowerTimeScheme not found. Skipping power time schemes." "Warning"
+    }
+
+    if (Get-Command Get-BrokerPowerAction -ErrorAction SilentlyContinue) {
+        $actions = Get-BrokerPowerAction -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+        $powerExport.PowerActions = foreach ($action in $actions) {
+            Convert-ToExportSafeObject -InputObject $action -PropertyNames @(
+                "Action",
+                "ActualPriority",
+                "BasePriority",
+                "Created",
+                "DesktopGroupUid",
+                "HostingUnitName",
+                "MachineName",
+                "State",
+                "Uid"
+            )
+        }
+    }
+    else {
+        Write-Log "Get-BrokerPowerAction not found. Skipping power actions." "Warning"
+    }
+
+    [pscustomobject]$powerExport
+}
+
+function Export-CtxRebootSchedules {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting reboot schedules..." "Info"
+
+    # Prefer V2 cmdlet
+    if (Get-Command Get-BrokerRebootScheduleV2 -ErrorAction SilentlyContinue) {
+
+        $schedules = Get-BrokerRebootScheduleV2 `
+            -AdminAddress $AdminAddress `
+            -MaxRecordCount 2147483647
+
+        $results = foreach ($schedule in $schedules) {
+
+            Convert-ToExportSafeObject `
+                -InputObject $schedule `
+                -PropertyNames @(
+                    "Name",
+                    "Uid",
+                    "DesktopGroupName",
+                    "DesktopGroupUid",
+                    "Enabled",
+                    "Frequency",
+                    "StartTime",
+                    "RebootDuration",
+                    "WarningDuration",
+                    "WarningMessage",
+                    "WarningRepeatInterval",
+                    "RestrictToTag"
+                )
+        }
+
+        return $results
+    }
+
+    # Fall back to legacy cmdlet
+    if (Get-Command Get-BrokerRebootSchedule -ErrorAction SilentlyContinue) {
+
+        Write-Log "Using legacy Get-BrokerRebootSchedule cmdlet." "Debug"
+
+        $legacySchedules = Get-BrokerRebootSchedule `
+            -AdminAddress $AdminAddress `
+            -MaxRecordCount 2147483647
+
+        $results = foreach ($schedule in $legacySchedules) {
+
+            Convert-ToExportSafeObject `
+                -InputObject $schedule `
+                -PropertyNames @(
+                    "Name",
+                    "Uid",
+                    "DesktopGroupName",
+                    "DesktopGroupUid",
+                    "Enabled",
+                    "Frequency",
+                    "StartTime",
+                    "RebootDuration",
+                    "WarningDuration",
+                    "WarningMessage"
+                )
+        }
+
+        return $results
+    }
+
+    Write-Log "No reboot schedule cmdlet found. Skipping reboot schedules." "Warning"
+
+    return @()
+}
+
+# =============================================================================
+# 6. Published Application Collector
+# =============================================================================
+
+function Export-CtxApplications {
+    param(
+        [string]$AdminAddress,
+        [string]$ResourcesFolder
+    )
+
+    Write-Log "Collecting published applications..." "Info"
+
+    $applications = Get-BrokerApplication -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($app in $applications) {
+        $iconUid = Get-SafeProperty -InputObject $app -PropertyName "IconUid"
+        $iconResource = $null
+
+        if ($null -ne $iconUid) {
+            $iconResource = Export-CtxApplicationIcon `
+                -AdminAddress $AdminAddress `
+                -Application $app `
+                -ResourcesFolder $ResourcesFolder
+        }
+
+        $appObject = Convert-ToExportSafeObject -InputObject $app -PropertyNames @(
+            "Name",
+            "Uid",
+            "UUID",
+            "ApplicationName",
+            "PublishedName",
+            "BrowserName",
+            "Description",
+            "Enabled",
+            "Visible",
+            "ApplicationType",
+            "CommandLineExecutable",
+            "CommandLineArguments",
+            "WorkingDirectory",
+            "ClientFolder",
+            "StartMenuFolder",
+            "AdminFolderName",
+            "ShortcutAddedToDesktop",
+            "ShortcutAddedToStartMenu",
+            "UserFilterEnabled",
+            "AssociatedUserNames",
+            "AssociatedUserFullNames",
+            "AssociatedUserUPNs",
+            "AssociatedDesktopGroupUids",
+            "AssociatedDesktopGroupUUIDs",
+            "AssociatedDesktopGroupPriorities",
+            "AssociatedApplicationGroupUids",
+            "IconUid",
+            "IconFromClient",
+            "SecureCmdLineArgumentsEnabled",
+            "CpuPriorityLevel",
+            "WaitForPrinterCreation",
+            "MetadataMap",
+            "MetadataKeys",
+            "Tags"
+        )
+
+        $appObject | Add-Member -MemberType NoteProperty -Name "IconResource" -Value $iconResource -Force
+
+        $fta = Export-CtxApplicationFileTypeAssociations `
+            -AdminAddress $AdminAddress `
+            -Application $app
+
+        $appObject | Add-Member -MemberType NoteProperty -Name "FileTypeAssociations" -Value $fta -Force
+
+        $appObject
+    }
+}
+
+function Export-CtxApplicationIcon {
+    param(
+        [string]$AdminAddress,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Application,
+
+        [string]$ResourcesFolder
+    )
+
+    $iconUid = Get-SafeProperty -InputObject $Application -PropertyName "IconUid"
+    $appName = Get-SafeProperty -InputObject $Application -PropertyName "Name"
+
+    if ($null -eq $iconUid) {
+        return $null
+    }
+
+    if (-not (Get-Command Get-BrokerIcon -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerIcon not found. Cannot export icon for application [$appName]." "Warning"
+        return $null
+    }
+
+    try {
+        $icon = Get-BrokerIcon -AdminAddress $AdminAddress -Uid $iconUid
+        $encodedIconData = Get-SafeProperty -InputObject $icon -PropertyName "EncodedIconData"
+
+        if ([string]::IsNullOrWhiteSpace($encodedIconData)) {
+            return [pscustomobject]@{
+                Exported        = $false
+                IconUid         = $iconUid
+                FileName        = $null
+                RelativePath    = $null
+                Encoding        = "EncodedIconData"
+                Error           = "No EncodedIconData returned."
+            }
+        }
+
+        $safeAppName = Convert-ToSafeFileName -Name $appName
+        $iconFileName = "$safeAppName`_$iconUid.txt"
+        $iconPath = Join-Path $ResourcesFolder $iconFileName
+
+        $encodedIconData | Out-File -FilePath $iconPath -Encoding ASCII -Force
+
+        return [pscustomobject]@{
+            Exported        = $true
+            IconUid         = $iconUid
+            FileName        = $iconFileName
+            RelativePath    = ".\$ResourcesFolderName\$iconFileName"
+            Encoding        = "EncodedIconData"
+        }
+    }
+    catch {
+        Write-Log "Failed to export icon for application [$appName]: $($_.Exception.Message)" "Warning"
+
+        return [pscustomobject]@{
+            Exported        = $false
+            IconUid         = $iconUid
+            FileName        = $null
+            RelativePath    = $null
+            Encoding        = "EncodedIconData"
+            Error           = $_.Exception.Message
+        }
+    }
+}
+
+function Export-CtxApplicationFileTypeAssociations {
+    param(
+        [string]$AdminAddress,
+
+        [Parameter(Mandatory = $true)]
+        [object]$Application
+    )
+
+    $appUid  = Get-SafeProperty -InputObject $Application -PropertyName "Uid"
+    $appName = Get-SafeProperty -InputObject $Application -PropertyName "Name"
+
+    if (-not (Get-Command Get-BrokerConfiguredFTA -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerConfiguredFTA not found. Skipping FTAs for application [$appName]." "Debug"
+        return @()
+    }
+
+    try {
+        $ftas = Get-BrokerConfiguredFTA -AdminAddress $AdminAddress -ApplicationUid $appUid -MaxRecordCount 2147483647
+
+        foreach ($fta in $ftas) {
+            Convert-ToExportSafeObject -InputObject $fta -PropertyNames @(
+                "Uid",
+                "ApplicationUid",
+                "ExtensionName",
+                "HandlerName",
+                "HandlerDescription",
+                "HandlerOpenArguments",
+                "HandlerOpenCommand",
+                "HandlerIcon"
+            )
+        }
+    }
+    catch {
+        Write-Log "Failed to collect FTAs for application [$appName]: $($_.Exception.Message)" "Warning"
+        @()
+    }
+}
+
+# =============================================================================
+# 7. Policy Collector
+# =============================================================================
+
+function Export-CtxPolicies {
+    param(
+        [string]$AdminAddress,
+        [bool]$IncludeBinaryExport
+    )
+
+    Write-Log "Collecting Citrix policy information..." "Info"
+
+    $policyExport = [ordered]@{
+        PolicySets           = @()
+        ExportedPolicyBinary = $null
+    }
+
+    if (Get-Command Get-BrokerPolicySet -ErrorAction SilentlyContinue) {
+        try {
+            $policySets = Get-BrokerPolicySet -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+            $policyExport.PolicySets = foreach ($set in $policySets) {
+                Convert-ToExportSafeObject -InputObject $set -PropertyNames @(
+                    "Name",
+                    "Guid",
+                    "Description",
+                    "IsDefault",
+                    "Priority",
+                    "Uid"
+                )
+            }
+        }
+        catch {
+            Write-Log "Failed to collect policy sets: $($_.Exception.Message)" "Warning"
+        }
+    }
+    else {
+        Write-Log "Get-BrokerPolicySet not found. Skipping policy set enumeration." "Warning"
+    }
+
+    if ($IncludeBinaryExport) {
+        if (-not (Get-Command Export-BrokerDesktopPolicy -ErrorAction SilentlyContinue)) {
+            Write-Log "Export-BrokerDesktopPolicy not found. Skipping policy binary export." "Warning"
+        }
+        else {
+            try {
+                $policyBytes = Export-BrokerDesktopPolicy -AdminAddress $AdminAddress
+
+                if ($null -ne $policyBytes) {
+                    $base64 = [Convert]::ToBase64String($policyBytes)
+
+                    $policyExport.ExportedPolicyBinary = [pscustomobject]@{
+                        Exported = $true
+                        Encoding = "Base64"
+                        Data     = $base64
+                    }
+                }
+                else {
+                    $policyExport.ExportedPolicyBinary = [pscustomobject]@{
+                        Exported = $false
+                        Encoding = "Base64"
+                        Data     = $null
+                        Reason   = "No policy data returned."
+                    }
+                }
+            }
+            catch {
+                Write-Log "Failed to export Citrix policy binary payload: $($_.Exception.Message)" "Warning"
+
+                $policyExport.ExportedPolicyBinary = [pscustomobject]@{
+                    Exported = $false
+                    Encoding = "Base64"
+                    Data     = $null
+                    Error    = $_.Exception.Message
+                }
+            }
+        }
+    }
+
+    [pscustomobject]$policyExport
+}
+
+# =============================================================================
+# 8. Optional supporting object collectors
+# =============================================================================
+
+function Export-CtxZones {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting zones..." "Info"
+
+    if (-not (Get-Command Get-ConfigZone -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-ConfigZone not found. Skipping zones." "Warning"
+        return @()
+    }
+
+    $zones = Get-ConfigZone -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($zone in $zones) {
+        Convert-ToExportSafeObject -InputObject $zone -PropertyNames @(
+            "Name",
+            "Uid",
+            "Description",
+            "IsPrimary",
+            "MetadataMap"
+        )
+    }
+}
+
+function Export-CtxApplicationGroups {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting application groups..." "Info"
+
+    if (-not (Get-Command Get-BrokerApplicationGroup -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerApplicationGroup not found. Skipping application groups." "Warning"
+        return @()
+    }
+
+    $groups = Get-BrokerApplicationGroup -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($group in $groups) {
+        Convert-ToExportSafeObject -InputObject $group -PropertyNames @(
+            "Name",
+            "Uid",
+            "UUID",
+            "Description",
+            "Enabled",
+            "RestrictToTag",
+            "AssociatedUserNames",
+            "AssociatedUserFullNames",
+            "AssociatedUserUPNs",
+            "MetadataMap",
+            "Tags"
+        )
+    }
+}
+
+function Export-CtxMachines {
+    param(
+        [string]$AdminAddress
+    )
+
+    Write-Log "Collecting machines..." "Info"
+
+    if (-not (Get-Command Get-BrokerMachine -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerMachine not found. Skipping machines." "Warning"
+        return @()
+    }
+
+    $machines = Get-BrokerMachine -AdminAddress $AdminAddress -MaxRecordCount 2147483647
+
+    foreach ($machine in $machines) {
+        Convert-ToExportSafeObject -InputObject $machine -PropertyNames @(
+            "MachineName",
+            "DNSName",
+            "Uid",
+            "UUID",
+            "CatalogName",
+            "CatalogUid",
+            "DesktopGroupName",
+            "DesktopGroupUid",
+            "HostedMachineName",
+            "HypervisorConnectionName",
+            "InMaintenanceMode",
+            "IsAssigned",
+            "IsPhysical",
+            "MachineInternalState",
+            "PowerState",
+            "ProvisioningType",
+            "RegistrationState",
+            "SessionSupport",
+            "Tags"
+        )
+    }
+}
+
+# =============================================================================
+# 9. Relationship Resolver
+# =============================================================================
+
+function Resolve-CtxRelationships {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$ExportModel
+    )
+
+    Write-Log "Resolving cross-object relationships..." "Info"
+
+    $relationships = [ordered]@{
+        ApplicationsToDeliveryGroups = @()
+        CatalogsToDeliveryGroups     = @()
+    }
+
+    $deliveryGroupLookup = @{}
+
+    foreach ($dg in $ExportModel.DeliveryGroups) {
+        if ($null -ne $dg.Uid) {
+            $deliveryGroupLookup[[string]$dg.Uid] = $dg.Name
+        }
+    }
+
+    foreach ($app in $ExportModel.Applications) {
+        $associatedDgUids = $app.AssociatedDesktopGroupUids
+
+        if ($null -eq $associatedDgUids) {
+            continue
+        }
+
+        foreach ($dgUid in $associatedDgUids) {
+            $relationships.ApplicationsToDeliveryGroups += [pscustomobject]@{
+                ApplicationName   = $app.Name
+                ApplicationUid    = $app.Uid
+                DeliveryGroupUid  = $dgUid
+                DeliveryGroupName = $deliveryGroupLookup[[string]$dgUid]
+            }
+        }
+    }
+
+    # Optional placeholder:
+    # Catalog-to-DG mapping can vary depending on environment and whether
+    # you want to map via machines, provisioning scheme metadata, or broker state.
+
+    [pscustomobject]$relationships
+}
+
+# =============================================================================
+# 10. Main Export Orchestration
+# =============================================================================
+
+function Invoke-CtxSiteExport {
+    param(
+        [string]$AdminAddress,
+        [string]$OutputFolder,
+        [string]$OutputXmlPath,
+        [string]$ResourcesFolder,
+        [bool]$IncludeNativeConfigXml,
+        [bool]$IncludePolicyBinaryExport
+    )
+
+    Ensure-Folder -Path $OutputFolder
+    Ensure-Folder -Path $ResourcesFolder
+
+    Import-CitrixSdk
+
+    Write-Log "Starting CVAD site export from AdminAddress [$AdminAddress]." "Info"
+    Write-Log "Output XML path: $OutputXmlPath" "Info"
+    Write-Log "Resources path:  $ResourcesFolder" "Info"
+
+    $exportStarted = Get-Date
+
+    $exportModel = [ordered]@{
+        ExportMetadata = [pscustomobject]@{
+            ExportedBy        = [Environment]::UserName
+            ExportedFrom      = [Environment]::MachineName
+            ExportStarted     = $exportStarted
+            AdminAddress      = $AdminAddress
+            OutputXmlPath     = $OutputXmlPath
+            ResourcesFolder   = $ResourcesFolder
+            FrameworkVersion  = "0.1.0-skeleton"
+            ExportFormat      = "Custom-CVAD-CLIXML"
+        }
+
+        SiteProperties       = $null
+        NativeConfigXml      = $null
+        Tags                 = @()
+        Administrators       = $null
+        Zones                = @()
+        Catalogs             = @()
+        ProvisioningSchemes  = @()
+        IdentityPools        = @()
+        DeliveryGroups       = @()
+        PowerManagement      = $null
+        RebootSchedules      = @()
+        ApplicationGroups    = @()
+        Applications         = @()
+        Machines             = @()
+        Policies             = $null
+        Relationships        = $null
+        ExportSummary        = $null
+    }
+
+    try {
+        $exportModel.SiteProperties      = Export-CtxSiteProperties -AdminAddress $AdminAddress
+        $exportModel.Tags                = @(Export-CtxTags -AdminAddress $AdminAddress)
+        $exportModel.Administrators      = Export-CtxAdministrators -AdminAddress $AdminAddress
+        $exportModel.Zones               = @(Export-CtxZones -AdminAddress $AdminAddress)
+        $exportModel.Catalogs            = @(Export-CtxCatalogs -AdminAddress $AdminAddress)
+        $exportModel.ProvisioningSchemes = @(Export-CtxProvisioningSchemes -AdminAddress $AdminAddress)
+        $exportModel.IdentityPools       = @(Export-CtxIdentityPools -AdminAddress $AdminAddress)
+        $exportModel.DeliveryGroups      = @(Export-CtxDeliveryGroups -AdminAddress $AdminAddress)
+        $exportModel.PowerManagement     = Export-CtxPowerManagement -AdminAddress $AdminAddress
+        $exportModel.RebootSchedules     = @(Export-CtxRebootSchedules -AdminAddress $AdminAddress)
+        $exportModel.ApplicationGroups   = @(Export-CtxApplicationGroups -AdminAddress $AdminAddress)
+        $exportModel.Applications        = @(Export-CtxApplications -AdminAddress $AdminAddress -ResourcesFolder $ResourcesFolder)
+        $exportModel.Machines            = @(Export-CtxMachines -AdminAddress $AdminAddress)
+        $exportModel.Policies            = Export-CtxPolicies -AdminAddress $AdminAddress -IncludeBinaryExport:$IncludePolicyBinaryExport
+
+        if ($IncludeNativeConfigXml) {
+            $exportModel.NativeConfigXml = Export-CtxNativeConfigurationXml `
+                -AdminAddress $AdminAddress `
+                -Path $Script:NativeConfigPath
+        }
+
+        $exportModel.Relationships = Resolve-CtxRelationships -ExportModel ([pscustomobject]$exportModel)
+
+        $exportCompleted = Get-Date
+
+        $exportModel.ExportSummary = [pscustomobject]@{
+            ExportCompleted              = $exportCompleted
+            SiteName                     = $exportModel.SiteProperties.Name
+            TagCount                     = @($exportModel.Tags).Count
+            AdministratorCount           = @($exportModel.Administrators.Administrators).Count
+            RoleCount                    = @($exportModel.Administrators.Roles).Count
+            ScopeCount                   = @($exportModel.Administrators.Scopes).Count
+            CatalogCount                 = @($exportModel.Catalogs).Count
+            ProvisioningSchemeCount      = @($exportModel.ProvisioningSchemes).Count
+            IdentityPoolCount            = @($exportModel.IdentityPools).Count
+            DeliveryGroupCount           = @($exportModel.DeliveryGroups).Count
+            RebootScheduleCount          = @($exportModel.RebootSchedules).Count
+            ApplicationGroupCount        = @($exportModel.ApplicationGroups).Count
+            ApplicationCount             = @($exportModel.Applications).Count
+            MachineCount                 = @($exportModel.Machines).Count
+            ApplicationIconExportedCount = @($exportModel.Applications | Where-Object {
+                $_.IconResource -and $_.IconResource.Exported -eq $true
+            }).Count
+        }
+
+        Write-Log "Serialising export model to XML..." "Info"
+
+        [pscustomobject]$exportModel | Export-Clixml -Path $OutputXmlPath -Force -Depth 20
+
+        Write-Log "CVAD export completed successfully." "Success"
+        Write-Log "XML file:       $OutputXmlPath" "Success"
+        Write-Log "Resources path: $ResourcesFolder" "Success"
+
+        return [pscustomobject]@{
+            Success         = $true
+            OutputXmlPath   = $OutputXmlPath
+            ResourcesFolder = $ResourcesFolder
+            Summary         = $exportModel.ExportSummary
+        }
+    }
+    catch {
+        Write-Log "CVAD export failed: $($_.Exception.Message)" "Error"
+
+        return [pscustomobject]@{
+            Success         = $false
+            OutputXmlPath   = $OutputXmlPath
+            ResourcesFolder = $ResourcesFolder
+            Error           = $_.Exception.Message
+        }
+    }
+}
+
+# =============================================================================
+# 11. Execute
+# =============================================================================
+
+$result = Invoke-CtxSiteExport `
+    -AdminAddress $AdminAddress `
+    -OutputFolder $OutputFolder `
+    -OutputXmlPath $Script:OutputXmlPath `
+    -ResourcesFolder $Script:ResourcesFolder `
+    -IncludeNativeConfigXml:$IncludeNativeConfigXml.IsPresent `
+    -IncludePolicyBinaryExport:$IncludePolicyBinaryExport.IsPresent
+
+$result
