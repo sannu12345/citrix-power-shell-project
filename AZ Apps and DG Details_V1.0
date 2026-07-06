@@ -1,0 +1,1223 @@
+<#
+.SYNOPSIS
+    Export CVAD Delivery Group, Application, VDA and Security Mapping.
+
+.DESCRIPTION
+    Produces a flattened report showing:
+        - Delivery Group
+        - Published Type
+        - Application Name
+        - Application Path
+        - Desktop Name (VDA)
+        - Security Group
+        - Limited Visibility Group/Users
+        - List of all VDAs for Delivery Group
+
+    Designed to be version-tolerant across CVAD 7.x / 1912 / 2203 / 2402+ where
+    the standard Citrix Broker PowerShell SDK is available.
+
+.OUTPUTS
+    CSV and HTML report.
+
+.DEFAULT OUTPUT
+    C:\Temp\Reports\CVAD_DG_App_VDA_Mapping.csv
+    C:\Temp\Reports\CVAD_DG_App_VDA_Mapping.html
+
+.PARAMETER AdminAddress
+    Delivery Controller address. Defaults to localhost.
+
+.PARAMETER OutputFolder
+    Report output folder. Defaults to C:\Temp\Reports.
+
+.PARAMETER ExpandVdas
+    If specified, creates one row per VDA per application/DG relationship.
+    If not specified, creates one row per app/DG relationship and lists all VDAs
+    in the final column.
+
+.PARAMETER IncludeDesktopOnlyRows
+    If specified, also outputs Delivery Groups that publish desktops even if no
+    published applications are associated.
+
+.PARAMETER ResolvePrincipalType
+    Attempts to classify principals as ADUser, ADGroup, Builtin, Unknown using
+    Active Directory if the AD module is available.
+
+.NOTES
+    Author: Miral Mehta / CVAD Reporting Framework
+    Target: CVAD on-prem Broker SDK
+    PowerShell: Windows PowerShell 5.1 recommended
+.Usage
+    Run "AZ Apps and DG Details_V1.0.ps1' -IncludeDesktopOnlyRows" from an elevated PowerShell command
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$AdminAddress = "localhost",
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFolder = "C:\Temp\Reports",
+
+    [Parameter(Mandatory = $false)]
+    [string]$CsvName = "CVAD_DG_App_VDA_Mapping.csv",
+
+    [Parameter(Mandatory = $false)]
+    [string]$HtmlName = "CVAD_DG_App_VDA_Mapping.html",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ExpandVdas,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeDesktopOnlyRows,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ResolvePrincipalType,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$VerboseLogging
+)
+
+# =============================================================================
+# 0. Runtime Settings
+# =============================================================================
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = "Stop"
+
+$CsvPath  = Join-Path $OutputFolder $CsvName
+$HtmlPath = Join-Path $OutputFolder $HtmlName
+
+# =============================================================================
+# 1. Helper Functions
+# =============================================================================
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Warning", "Error", "Success", "Debug")]
+        [string]$Level = "Info"
+    )
+
+    $colour = switch ($Level) {
+        "Info"    { "Cyan" }
+        "Warning" { "Yellow" }
+        "Error"   { "Red" }
+        "Success" { "Green" }
+        "Debug"   { "DarkGray" }
+    }
+
+    if ($Level -ne "Debug" -or $VerboseLogging.IsPresent) {
+        Write-Host "[$Level] $Message" -ForegroundColor $colour
+    }
+}
+
+function Ensure-Folder {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -ItemType Directory -Path $Path -Force)
+    }
+}
+
+function Import-CitrixSdk {
+    Write-Log "Loading Citrix PowerShell SDK..." "Info"
+
+    try {
+        Add-PSSnapin Citrix* -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Add-PSSnapin Citrix* did not load anything. Continuing to module check." "Debug"
+    }
+
+    try {
+        Import-Module Citrix.* -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Import-Module Citrix.* did not load anything. Continuing." "Debug"
+    }
+
+    $requiredCmdlets = @(
+        "Get-BrokerDesktopGroup",
+        "Get-BrokerApplication",
+        "Get-BrokerMachine"
+    )
+
+    foreach ($cmdlet in $requiredCmdlets) {
+        if (-not (Get-Command $cmdlet -ErrorAction SilentlyContinue)) {
+            throw "Required Citrix SDK cmdlet not found: $cmdlet. Install/run from a machine with the CVAD PowerShell SDK or Studio tools."
+        }
+    }
+
+    Write-Log "Citrix PowerShell SDK loaded." "Success"
+}
+
+function Get-SafeProperty {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName,
+
+        [Parameter(Mandatory = $false)]
+        [object]$DefaultValue = $null
+    )
+
+    if ($null -eq $InputObject) {
+        return $DefaultValue
+    }
+
+    $property = $InputObject.PSObject.Properties[$PropertyName]
+
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Convert-ToStringList {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Value,
+
+        [string]$Delimiter = "; "
+    )
+
+    if ($null -eq $Value) {
+        return ""
+    }
+
+    if ($Value -is [string]) {
+        return $Value
+    }
+
+    try {
+        $items = @($Value) | Where-Object {
+            $null -ne $_ -and "$_".Trim().Length -gt 0
+        } | ForEach-Object {
+            "$_".Trim()
+        } | Sort-Object -Unique
+
+        return ($items -join $Delimiter)
+    }
+    catch {
+        return "$Value"
+    }
+}
+
+function Get-PrincipalNameFromObject {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Principal
+    )
+
+    if ($null -eq $Principal) {
+        return $null
+    }
+
+    if ($Principal -is [string]) {
+        return $Principal
+    }
+
+    $candidateProperties = @(
+        "Name",
+        "UserName",
+        "FullName",
+        "Sid",
+        "SecurityIdentifier"
+    )
+
+    foreach ($propertyName in $candidateProperties) {
+        $value = Get-SafeProperty -InputObject $Principal -PropertyName $propertyName
+        if ($null -ne $value -and "$value".Trim().Length -gt 0) {
+            return "$value"
+        }
+    }
+
+    return "$Principal"
+}
+
+function Convert-PrincipalsToNames {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Principals
+    )
+
+    if ($null -eq $Principals) {
+        return @()
+    }
+
+    $names = foreach ($principal in @($Principals)) {
+        $name = Get-PrincipalNameFromObject -Principal $principal
+
+        if ($null -ne $name -and $name.Trim().Length -gt 0) {
+            $name.Trim()
+        }
+    }
+
+    return @($names | Sort-Object -Unique)
+}
+
+function Get-PrincipalClassification {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Principal
+    )
+
+    if (-not $ResolvePrincipalType.IsPresent) {
+        return "NotResolved"
+    }
+
+    if (-not (Get-Command Get-ADObject -ErrorAction SilentlyContinue)) {
+        return "ADModuleUnavailable"
+    }
+
+    try {
+        $escaped = $Principal.Replace("'", "''")
+
+        # Try direct SamAccountName / Name lookup first.
+        $adObject = Get-ADObject `
+            -Filter "SamAccountName -eq '$escaped' -or Name -eq '$escaped'" `
+            -Properties objectClass `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+        if ($null -eq $adObject -and $Principal -match "\\") {
+            $sam = ($Principal -split "\\")[-1]
+            $escapedSam = $sam.Replace("'", "''")
+
+            $adObject = Get-ADObject `
+                -Filter "SamAccountName -eq '$escapedSam' -or Name -eq '$escapedSam'" `
+                -Properties objectClass `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
+
+        if ($null -eq $adObject) {
+            return "Unknown"
+        }
+
+        switch ($adObject.objectClass) {
+            "user"  { return "ADUser" }
+            "group" { return "ADGroup" }
+            default { return $adObject.objectClass }
+        }
+    }
+    catch {
+        return "LookupFailed"
+    }
+}
+
+function Format-PrincipalListWithType {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Principals
+    )
+
+    $names = Convert-PrincipalsToNames -Principals $Principals
+
+    if (@($names).Count -eq 0) {
+        return ""
+    }
+
+    if (-not $ResolvePrincipalType.IsPresent) {
+        return ($names -join "; ")
+    }
+
+    $formatted = foreach ($name in $names) {
+        $type = Get-PrincipalClassification -Principal $name
+        "$name [$type]"
+    }
+
+    return ($formatted | Sort-Object -Unique) -join "; "
+}
+
+function Get-PublishedType {
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Application,
+
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$DeliveryGroup,
+
+        [switch]$DesktopOnly
+    )
+
+    if ($DesktopOnly.IsPresent) {
+        return "Desktop"
+    }
+
+    $applicationType = Get-SafeProperty -InputObject $Application -PropertyName "ApplicationType"
+
+    if ($null -ne $applicationType -and "$applicationType".Trim().Length -gt 0) {
+        switch ("$applicationType") {
+            "HostedOnDesktop"   { return "Published Application" }
+            "InstalledOnClient" { return "Client Application" }
+            "PublishedContent"  { return "Published Content" }
+            default             { return "$applicationType" }
+        }
+    }
+
+    $deliveryType = Get-SafeProperty -InputObject $DeliveryGroup -PropertyName "DeliveryType"
+    $desktopKind  = Get-SafeProperty -InputObject $DeliveryGroup -PropertyName "DesktopKind"
+
+    if ($null -ne $deliveryType -and "$deliveryType".Trim().Length -gt 0) {
+        return "DeliveryGroup:$deliveryType"
+    }
+
+    if ($null -ne $desktopKind -and "$desktopKind".Trim().Length -gt 0) {
+        return "Desktop:$desktopKind"
+    }
+
+    return "Unknown"
+}
+
+function Add-ToLookupList {
+    param(
+        [hashtable]$Lookup,
+        [string]$Key,
+        [object]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Key)) {
+        return
+    }
+
+    if (-not $Lookup.ContainsKey($Key)) {
+        $Lookup[$Key] = New-Object System.Collections.ArrayList
+    }
+
+    [void]$Lookup[$Key].Add($Value)
+}
+
+# =============================================================================
+# 2. CVAD Collectors
+# =============================================================================
+
+function Get-CtxDeliveryGroups {
+    param([string]$AdminAddress)
+
+    Write-Log "Collecting Delivery Groups..." "Info"
+
+    @(Get-BrokerDesktopGroup -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+}
+
+function Get-CtxApplications {
+    param([string]$AdminAddress)
+
+    Write-Log "Collecting Published Applications..." "Info"
+
+    @(Get-BrokerApplication -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+}
+
+function Get-CtxMachines {
+    param([string]$AdminAddress)
+
+    Write-Log "Collecting VDAs / Broker Machines..." "Info"
+
+    @(Get-BrokerMachine -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+}
+
+function Get-CtxApplicationGroups {
+    param([string]$AdminAddress)
+
+    if (-not (Get-Command Get-BrokerApplicationGroup -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerApplicationGroup not available. Application Group enrichment will be skipped." "Warning"
+        return @()
+    }
+
+    Write-Log "Collecting Application Groups..." "Info"
+
+    try {
+        return @(Get-BrokerApplicationGroup -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+    }
+    catch {
+        Write-Log "Failed to collect Application Groups: $($_.Exception.Message)" "Warning"
+        return @()
+    }
+}
+
+function Get-CtxEntitlementPolicyRules {
+    param([string]$AdminAddress)
+
+    if (-not (Get-Command Get-BrokerEntitlementPolicyRule -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerEntitlementPolicyRule not available. DG entitlement/security enrichment will be limited." "Warning"
+        return @()
+    }
+
+    Write-Log "Collecting Delivery Group entitlement policy rules..." "Info"
+
+    try {
+        return @(Get-BrokerEntitlementPolicyRule -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+    }
+    catch {
+        Write-Log "Failed to collect entitlement policy rules: $($_.Exception.Message)" "Warning"
+        return @()
+    }
+}
+
+function Get-CtxAccessPolicyRules {
+    param([string]$AdminAddress)
+
+    if (-not (Get-Command Get-BrokerAccessPolicyRule -ErrorAction SilentlyContinue)) {
+        Write-Log "Get-BrokerAccessPolicyRule not available. Access policy enrichment will be skipped." "Warning"
+        return @()
+    }
+
+    Write-Log "Collecting access policy rules..." "Info"
+
+    try {
+        return @(Get-BrokerAccessPolicyRule -AdminAddress $AdminAddress -MaxRecordCount 2147483647)
+    }
+    catch {
+        Write-Log "Failed to collect access policy rules: $($_.Exception.Message)" "Warning"
+        return @()
+    }
+}
+
+# =============================================================================
+# 3. Lookup Builders
+# =============================================================================
+
+function New-DgLookup {
+    param([object[]]$DeliveryGroups)
+
+    $lookup = @{}
+
+    foreach ($dg in $DeliveryGroups) {
+        $uid = Get-SafeProperty -InputObject $dg -PropertyName "Uid"
+
+        if ($null -ne $uid) {
+            $lookup[[string]$uid] = $dg
+        }
+    }
+
+    return $lookup
+}
+
+function New-AppGroupLookup {
+    param([object[]]$ApplicationGroups)
+
+    $lookup = @{}
+
+    foreach ($appGroup in $ApplicationGroups) {
+        $uid = Get-SafeProperty -InputObject $appGroup -PropertyName "Uid"
+
+        if ($null -eq $uid) {
+            $uid = Get-SafeProperty -InputObject $appGroup -PropertyName "ApplicationGroupUid"
+        }
+
+        if ($null -ne $uid) {
+            $lookup[[string]$uid] = $appGroup
+        }
+    }
+
+    return $lookup
+}
+
+function New-MachinesByDgLookup {
+    param([object[]]$Machines)
+
+    $Machines = @($Machines)
+    $lookup = @{}
+
+    foreach ($machine in $Machines) {
+
+
+        $dgUid = Get-SafeProperty -InputObject $machine -PropertyName "DesktopGroupUid"
+        if ($null -ne $dgUid) {
+        $Key = "$dgUid"
+        Add-ToLookupList -Lookup $lookup -Key $Key -Value $machine
+        }
+
+        $assocUids = Get-SafeProperty -InputObject $machine -PropertyName "associatedDesktopGroupUids"
+        foreach ($uid in @($assocUids)) {
+            if ($null -ne $uid) {
+                $Key = "$uid"
+                Add-ToLookupList -Lookup $lookup -Key $Key -Value $machine
+            }
+        }
+    }
+
+    return $lookup
+}
+
+function New-EntitlementsByDgLookup {
+    param([object[]]$EntitlementRules)
+
+    $lookup = @{}
+
+    foreach ($rule in $EntitlementRules) {
+        $dgUid = Get-SafeProperty -InputObject $rule -PropertyName "DesktopGroupUid"
+
+        if ($null -ne $dgUid) {
+            Add-ToLookupList -Lookup $lookup -Key ([string]$dgUid) -Value $rule
+        }
+    }
+
+    return $lookup
+}
+
+function New-AccessRulesByDgLookup {
+    param([object[]]$AccessRules)
+
+    $lookup = @{}
+
+    foreach ($rule in $AccessRules) {
+        $dgUid = Get-SafeProperty -InputObject $rule -PropertyName "DesktopGroupUid"
+
+        if ($null -ne $dgUid) {
+            Add-ToLookupList -Lookup $lookup -Key ([string]$dgUid) -Value $rule
+        }
+    }
+
+    return $lookup
+}
+
+# =============================================================================
+# 4. Relationship Resolution
+# =============================================================================
+
+function Get-DgUidsForApplication {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Application,
+
+        [hashtable]$AppGroupLookup
+    )
+
+    $dgUidSet = New-Object System.Collections.Generic.HashSet[string]
+
+    # Direct application-to-DG association.
+    $directDgUids = Get-SafeProperty -InputObject $Application -PropertyName "AssociatedDesktopGroupUids"
+
+    foreach ($uid in @($directDgUids)) {
+        if ($null -ne $uid) {
+            [void]$dgUidSet.Add([string]$uid)
+        }
+    }
+
+    # Application Group association, where present.
+    $appGroupUids = Get-SafeProperty -InputObject $Application -PropertyName "AssociatedApplicationGroupUids"
+
+    foreach ($appGroupUid in @($appGroupUids)) {
+        if ($null -eq $appGroupUid) {
+            continue
+        }
+
+        $key = [string]$appGroupUid
+
+        if (-not $AppGroupLookup.ContainsKey($key)) {
+            continue
+        }
+
+        $appGroup = $AppGroupLookup[$key]
+
+        $appGroupDgUids = Get-SafeProperty -InputObject $appGroup -PropertyName "AssociatedDesktopGroupUids"
+
+        foreach ($dgUid in @($appGroupDgUids)) {
+            if ($null -ne $dgUid) {
+                [void]$dgUidSet.Add([string]$dgUid)
+            }
+        }
+    }
+
+    return @($dgUidSet)
+}
+
+function Get-VdaNamesForDg {
+    param(
+        [string]$DeliveryGroupUid,
+        [hashtable]$MachinesByDgLookup
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DeliveryGroupUid)) {
+        return @()
+    }
+
+    if (-not $MachinesByDgLookup.ContainsKey($DeliveryGroupUid)) {
+        return @()
+    }
+
+    $machineNames = foreach ($machine in @($MachinesByDgLookup[$DeliveryGroupUid])) {
+        $machineName = Get-SafeProperty -InputObject $machine -PropertyName "MachineName"
+        $dnsName     = Get-SafeProperty -InputObject $machine -PropertyName "DNSName"
+        $hostedName  = Get-SafeProperty -InputObject $machine -PropertyName "HostedMachineName"
+
+        if ($null -ne $machineName -and "$machineName".Trim().Length -gt 0) {
+            "$machineName".Trim()
+        }
+        elseif ($null -ne $dnsName -and "$dnsName".Trim().Length -gt 0) {
+            "$dnsName".Trim()
+        }
+        elseif ($null -ne $hostedName -and "$hostedName".Trim().Length -gt 0) {
+            "$hostedName".Trim()
+        }
+    }
+
+    $machineNames = @($machineNames | Sort-Object -Unique)
+
+    return ,$machineNames 
+}
+
+function Get-DgSecurityPrincipals {
+    param(
+        [string]$DeliveryGroupUid,
+        [hashtable]$EntitlementsByDgLookup,
+        [hashtable]$AccessRulesByDgLookup
+    )
+
+    $principals = New-Object System.Collections.ArrayList
+
+    if (-not [string]::IsNullOrWhiteSpace($DeliveryGroupUid)) {
+
+        if ($EntitlementsByDgLookup.ContainsKey($DeliveryGroupUid)) {
+            foreach ($rule in @($EntitlementsByDgLookup[$DeliveryGroupUid])) {
+                $includedUsers = Get-SafeProperty -InputObject $rule -PropertyName "IncludedUsers"
+                $names = Convert-PrincipalsToNames -Principals $includedUsers
+
+                foreach ($name in $names) {
+                    [void]$principals.Add($name)
+                }
+            }
+        }
+
+        if ($AccessRulesByDgLookup.ContainsKey($DeliveryGroupUid)) {
+            foreach ($rule in @($AccessRulesByDgLookup[$DeliveryGroupUid])) {
+                $includedUsers = Get-SafeProperty -InputObject $rule -PropertyName "IncludedUsers"
+                $names = Convert-PrincipalsToNames -Principals $includedUsers
+
+                foreach ($name in $names) {
+                    [void]$principals.Add($name)
+                }
+            }
+        }
+    }
+
+    return @($principals | Sort-Object -Unique)
+}
+
+function Get-AppLimitedVisibilityPrincipals {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Application,
+
+        [hashtable]$AppGroupLookup
+    )
+
+    $principals = New-Object System.Collections.ArrayList
+
+    $userFilterEnabled = Get-SafeProperty -InputObject $Application -PropertyName "UserFilterEnabled" -DefaultValue $false
+
+    if ($userFilterEnabled -eq $true) {
+        $appUsers = Get-SafeProperty -InputObject $Application -PropertyName "AssociatedUserNames"
+        $appUserNames = Convert-PrincipalsToNames -Principals $appUsers
+
+        foreach ($name in $appUserNames) {
+            [void]$principals.Add($name)
+        }
+    }
+
+    # Application group-level visibility or assignment.
+    $appGroupUids = Get-SafeProperty -InputObject $Application -PropertyName "AssociatedApplicationGroupUids"
+
+    foreach ($appGroupUid in @($appGroupUids)) {
+        if ($null -eq $appGroupUid) {
+            continue
+        }
+
+        $key = [string]$appGroupUid
+
+        if (-not $AppGroupLookup.ContainsKey($key)) {
+            continue
+        }
+
+        $appGroup = $AppGroupLookup[$key]
+
+        $groupUsers = Get-SafeProperty -InputObject $appGroup -PropertyName "AssociatedUserNames"
+        $groupUserNames = Convert-PrincipalsToNames -Principals $groupUsers
+
+        foreach ($name in $groupUserNames) {
+            [void]$principals.Add($name)
+        }
+    }
+
+    return @($principals | Sort-Object -Unique)
+}
+
+function Get-ApplicationPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Application
+    )
+
+    $exe  = Get-SafeProperty -InputObject $Application -PropertyName "CommandLineExecutable"
+    $args = Get-SafeProperty -InputObject $Application -PropertyName "CommandLineArguments"
+
+    if ($null -eq $exe -or "$exe".Trim().Length -eq 0) {
+        return ""
+    }
+
+    if ($null -ne $args -and "$args".Trim().Length -gt 0) {
+        return "$exe $args"
+    }
+
+    return "$exe"
+}
+
+# =============================================================================
+# 5. Report Builder
+# =============================================================================
+
+function New-ReportRow {
+    param(
+        [string]$DeliveryGroup,
+        [string]$PublishedType,
+        [string]$ApplicationName,
+        [string]$ApplicationPath,
+        [string]$DesktopNameVda,
+        [string]$SecurityGroup,
+        [string]$LimitedVisibility,
+        [string]$AllVdasForDg
+    )
+
+    [pscustomobject][ordered]@{
+        "Delivery Group"                  = $DeliveryGroup
+        "Published Type"                  = $PublishedType
+        "Application Name"                = $ApplicationName
+        "Application Path"                = $ApplicationPath
+        "Desktop Name (VDA)"              = $DesktopNameVda
+        "Security Group"                  = $SecurityGroup
+        "Limited Visibility Group/Users"  = $LimitedVisibility
+        "List of all VDAs for Delivery Group" = $AllVdasForDg
+    }
+}
+
+function Build-CvadMappingReport {
+    param(
+        [object[]]$DeliveryGroups,
+        [object[]]$Applications,
+        [object[]]$ApplicationGroups,
+        [object[]]$Machines,
+        [object[]]$EntitlementRules,
+        [object[]]$AccessRules
+    )
+
+    $DeliveryGroups    = @($DeliveryGroups)
+    $Applications      = @($Applications)
+    $ApplicationGroups = @($ApplicationGroups)
+    $Machines          = @($Machines)
+    $EntitlementRules  = @($EntitlementRules)
+    $AccessRules       = @($AccessRules)
+
+    $reportedRowsLocal = New-Object System.Collections.ArrayList
+
+    Write-Log "Building lookup tables..." "Info"
+
+    $dgLookup           = New-DgLookup -DeliveryGroups $DeliveryGroups
+    $appGroupLookup     = New-AppGroupLookup -ApplicationGroups $ApplicationGroups
+    $machinesByDgLookup = New-MachinesByDgLookup -Machines $Machines
+    $entitlementsByDg   = New-EntitlementsByDgLookup -EntitlementRules $EntitlementRules
+    $accessRulesByDg    = New-AccessRulesByDgLookup -AccessRules $AccessRules
+
+    Write-Log "Resolving application to delivery group to VDA mappings..." "Info"
+
+    foreach ($app in $Applications) {
+
+        $appName = Get-SafeProperty -InputObject $app -PropertyName "Name"
+
+        if ($null -eq $appName -or "$appName".Trim().Length -eq 0) {
+            $appName = Get-SafeProperty -InputObject $app -PropertyName "ApplicationName"
+        }
+
+        $applicationPath = Get-ApplicationPath -Application $app
+        $dgUids = @(Get-DgUidsForApplication -Application $app -AppGroupLookup $appGroupLookup)
+
+        if (-not $dgUids -or @($dgUids).Count -eq 0) {
+
+            $limitedVisibilityPrincipals = Get-AppLimitedVisibilityPrincipals `
+                -Application $app `
+                -AppGroupLookup $appGroupLookup
+
+            $limitedVisibilityText = Format-PrincipalListWithType `
+                -Principals $limitedVisibilityPrincipals
+
+            $publishedType = Get-PublishedType `
+                -Application $app `
+                -DeliveryGroup $null
+
+            $row = New-ReportRow `
+                -DeliveryGroup "<No Delivery Group Resolved>" `
+                -PublishedType $publishedType `
+                -ApplicationName $appName `
+                -ApplicationPath $applicationPath `
+                -DesktopNameVda "" `
+                -SecurityGroup "" `
+                -LimitedVisibility $limitedVisibilityText `
+                -AllVdasForDg ""
+
+            [void]$reportedRowsLocal.Add($row)
+            continue
+        }
+
+        foreach ($dgUid in $dgUids) {
+
+            $deliveryGroup = $null
+            $dgUidString = "$dgUid"
+
+            if ($dgLookup.ContainsKey($dgUidString)) {
+                $deliveryGroup = $dgLookup[$dgUidString]
+            }
+
+            $dgName = Get-SafeProperty `
+                -InputObject $deliveryGroup `
+                -PropertyName "Name" `
+                -DefaultValue "<Unknown DG UID $dgUidString>"
+
+            $vdaNames = @(Get-VdaNamesForDg `
+                -DeliveryGroupUid $dgUidString `
+                -MachinesByDgLookup $machinesByDgLookup)
+
+            $allVdasText = Convert-ToStringList -Value $vdaNames
+
+            $dgSecurityPrincipals = Get-DgSecurityPrincipals `
+                -DeliveryGroupUid $dgUidString `
+                -EntitlementsByDgLookup $entitlementsByDg `
+                -AccessRulesByDgLookup $accessRulesByDg
+
+            $securityGroupText = Format-PrincipalListWithType `
+                -Principals $dgSecurityPrincipals
+
+            $limitedVisibilityPrincipals = Get-AppLimitedVisibilityPrincipals `
+                -Application $app `
+                -AppGroupLookup $appGroupLookup
+
+            $limitedVisibilityText = Format-PrincipalListWithType `
+                -Principals $limitedVisibilityPrincipals
+
+            $publishedType = Get-PublishedType `
+                -Application $app `
+                -DeliveryGroup $deliveryGroup
+
+            if ($ExpandVdas.IsPresent) {
+
+                if (-not $vdaNames -or @($vdaNames).Count -eq 0) {
+
+                    $row = New-ReportRow `
+                        -DeliveryGroup $dgName `
+                        -PublishedType $publishedType `
+                        -ApplicationName $appName `
+                        -ApplicationPath $applicationPath `
+                        -DesktopNameVda "" `
+                        -SecurityGroup $securityGroupText `
+                        -LimitedVisibility $limitedVisibilityText `
+                        -AllVdasForDg $allVdasText
+
+                    [void]$reportedRowsLocal.Add($row)
+                }
+                else {
+
+                    foreach ($vda in @($vdaNames)) {
+
+                        $row = New-ReportRow `
+                            -DeliveryGroup $dgName `
+                            -PublishedType $publishedType `
+                            -ApplicationName $appName `
+                            -ApplicationPath $applicationPath `
+                            -DesktopNameVda $vda `
+                            -SecurityGroup $securityGroupText `
+                            -LimitedVisibility $limitedVisibilityText `
+                            -AllVdasForDg $allVdasText
+
+                        [void]$reportedRowsLocal.Add($row)
+                    }
+                }
+            }
+            else {
+
+                $desktopNameValue = ""
+
+                if (@($vdaNames).Count -eq 1) {
+                    $desktopNameValue = $vdaNames[0]
+                }
+                elseif (@($vdaNames).Count -gt 1) {
+                    $desktopNameValue = "<Multiple VDAs - see final column>"
+                }
+
+                $row = New-ReportRow `
+                    -DeliveryGroup $dgName `
+                    -PublishedType $publishedType `
+                    -ApplicationName $appName `
+                    -ApplicationPath $applicationPath `
+                    -DesktopNameVda $desktopNameValue `
+                    -SecurityGroup $securityGroupText `
+                    -LimitedVisibility $limitedVisibilityText `
+                    -AllVdasForDg $allVdasText
+
+                [void]$reportedRowsLocal.Add($row)
+            }
+        }
+    }
+
+    if ($IncludeDesktopOnlyRows.IsPresent) {
+
+        Write-Log "Adding desktop rows for desktop-capable Delivery Groups..." "Info"
+
+        foreach ($dg in $DeliveryGroups) {
+            
+            $dgUid = Get-SafeProperty -InputObject $dg -PropertyName "Uid"
+            $dgName = Get-SafeProperty -InputObject $dg -PropertyName "Name"
+            $deliveryType = Get-SafeProperty -InputObject $dg -PropertyName "DeliveryType"
+
+            $dgUidString = "$dgUid"
+            $deliveryTypeText = "$deliveryType"
+
+            Write-Host "Debug: processing DG = $dgName | Type = $deliveryTypeText" -ForegroundColor Yellow
+
+            #if ($deliveryTypeText -ne "Desktop" -and $deliveryTypeText -ne "DesktopsAndApps") {
+            if ($deliveryTypeText -notmatch "Desktop") {
+                continue
+            }
+
+            Write-Log "Adding desktop row for Delivery Group [$dgName] with delivery type [$deliveryTypeText]." "Debug"
+
+            $publishedName = Get-SafeProperty `
+                -InputObject $dg `
+                -PropertyName "PublishedName"
+
+            if ($null -eq $publishedName -or "$publishedName".Trim().Length -eq 0) {
+                $publishedName = $dgName
+            }
+
+            $vdaNames = @(Get-VdaNamesForDg `
+                -DeliveryGroupUid $dgUidString `
+                -MachinesByDgLookup $machinesByDgLookup)
+
+            $allVdasText = Convert-ToStringList -Value $vdaNames
+
+            $dgSecurityPrincipals = Get-DgSecurityPrincipals `
+                -DeliveryGroupUid $dgUidString `
+                -EntitlementsByDgLookup $entitlementsByDg `
+                -AccessRulesByDgLookup $accessRulesByDg
+
+            $securityGroupText = Format-PrincipalListWithType `
+                -Principals $dgSecurityPrincipals
+
+            if ($ExpandVdas.IsPresent) {
+
+                if (-not $vdaNames -or @($vdaNames).Count -eq 0) {
+
+                    $row = New-ReportRow `
+                        -DeliveryGroup $dgName `
+                        -PublishedType "Desktop" `
+                        -ApplicationName $publishedName `
+                        -ApplicationPath "<Desktop>" `
+                        -DesktopNameVda "" `
+                        -SecurityGroup $securityGroupText `
+                        -LimitedVisibility "" `
+                        -AllVdasForDg $allVdasText
+
+                    [void]$reportedRowsLocal.Add($row)
+                }
+                else {
+
+                    foreach ($vda in @($vdaNames)) {
+
+                        $row = New-ReportRow `
+                            -DeliveryGroup $dgName `
+                            -PublishedType "Desktop" `
+                            -ApplicationName $publishedName `
+                            -ApplicationPath "<Desktop>" `
+                            -DesktopNameVda $vda `
+                            -SecurityGroup $securityGroupText `
+                            -LimitedVisibility "" `
+                            -AllVdasForDg $allVdasText
+
+                        [void]$reportedRowsLocal.Add($row)
+                    }
+                }
+            }
+            else {
+
+                $desktopNameValue = ""
+
+                if (@($vdaNames).Count -eq 1) {
+                    $desktopNameValue = $vdaNames[0]
+                }
+                elseif (@($vdaNames).Count -gt 1) {
+                    $desktopNameValue = "<Multiple VDAs - see final column>"
+                }
+
+                $row = New-ReportRow `
+                    -DeliveryGroup $dgName `
+                    -PublishedType "Desktop" `
+                    -ApplicationName $publishedName `
+                    -ApplicationPath "<Desktop>" `
+                    -DesktopNameVda $desktopNameValue `
+                    -SecurityGroup $securityGroupText `
+                    -LimitedVisibility "" `
+                    -AllVdasForDg $allVdasText
+
+                [void]$reportedRowsLocal.Add($row)
+            }
+        }
+    }
+
+    return @($reportedRowsLocal)
+}
+        #return @($reportedRowsLocal)
+
+# =============================================================================
+# 6. HTML Export
+# =============================================================================
+
+function Export-HtmlReport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $style = @"
+<style>
+body {
+    font-family: Segoe UI, Arial, sans-serif;
+    font-size: 12px;
+    margin: 20px;
+    color: #222;
+}
+h1 {
+    color: #1f4e79;
+}
+.summary {
+    margin-bottom: 18px;
+    padding: 10px;
+    background-color: #eef5fb;
+    border: 1px solid #c7ddeb;
+}
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+th {
+    background-color: #1f4e79;
+    color: white;
+    padding: 6px;
+    border: 1px solid #d9d9d9;
+    text-align: left;
+    position: sticky;
+    top: 0;
+}
+td {
+    padding: 5px;
+    border: 1px solid #d9d9d9;
+    vertical-align: top;
+}
+tr:nth-child(even) {
+    background-color: #f7f7f7;
+}
+</style>
+"@
+
+    $preContent = @"
+<h1>CVAD Delivery Group / Application / VDA Mapping</h1>
+<div class='summary'>
+    <b>Generated:</b> $generated<br/>
+    <b>Rows:</b> $($Rows.Count)<br/>
+    <b>AdminAddress:</b> $AdminAddress<br/>
+    <b>ExpandVdas:</b> $($ExpandVdas.IsPresent)<br/>
+    <b>IncludeDesktopOnlyRows:</b> $($IncludeDesktopOnlyRows.IsPresent)<br/>
+    <b>ResolvePrincipalType:</b> $($ResolvePrincipalType.IsPresent)
+</div>
+"@
+
+    $html = $Rows |
+        ConvertTo-Html `
+            -Head $style `
+            -PreContent $preContent `
+            -Title "CVAD Delivery Group Application VDA Mapping"
+
+    $html | Out-File -FilePath $Path -Encoding UTF8 -Force
+}
+
+# =============================================================================
+# 7. Main Execution
+# =============================================================================
+
+try {
+    Ensure-Folder -Path $OutputFolder
+    Import-CitrixSdk
+
+    Write-Log "Starting CVAD mapping export." "Info"
+    Write-Log "AdminAddress: $AdminAddress" "Info"
+    Write-Log "Output CSV:   $CsvPath" "Info"
+    Write-Log "Output HTML:  $HtmlPath" "Info"
+
+    $deliveryGroups   = Get-CtxDeliveryGroups -AdminAddress $AdminAddress
+    $applications     = Get-CtxApplications -AdminAddress $AdminAddress
+    $machines         = Get-CtxMachines -AdminAddress $AdminAddress
+    $applicationGroups = Get-CtxApplicationGroups -AdminAddress $AdminAddress
+    $entitlementRules = Get-CtxEntitlementPolicyRules -AdminAddress $AdminAddress
+    $accessRules      = Get-CtxAccessPolicyRules -AdminAddress $AdminAddress
+
+    $reportedRows = @()
+    
+    $reportedRows = @(Build-CvadMappingReport `
+        -DeliveryGroups $deliveryGroups `
+        -Applications $applications `
+        -ApplicationGroups $applicationGroups `
+        -Machines $machines `
+        -EntitlementRules $entitlementRules `
+        -AccessRules $accessRules)
+
+    if ($null -eq $reportedRows) {
+        $reportedRows =@()
+        }
+
+    Write-Log "Exporting CSV..." "Info"
+    $reportedRows | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8 -Force
+
+    Write-Log "Exporting HTML..." "Info"
+    Export-HtmlReport -Rows $reportedRows -Path $HtmlPath
+
+    Write-Log "Completed successfully." "Success"
+
+    [pscustomobject]@{
+        Success                  = $true
+        CsvPath                  = $CsvPath
+        HtmlPath                 = $HtmlPath
+        DeliveryGroupCount       = @($deliveryGroups).Count
+        ApplicationCount         = @($applications).Count
+        ApplicationGroupCount    = @($applicationGroups).Count
+        MachineCount             = @($machines).Count
+        EntitlementRuleCount     = @($entitlementRules).Count
+        AccessRuleCount          = @($accessRules).Count
+        ReportRowCount           = @($reportedRows).Count
+        ExpandVdas               = $ExpandVdas.IsPresent
+        IncludeDesktopOnlyRows   = $IncludeDesktopOnlyRows.IsPresent
+        ResolvePrincipalType     = $ResolvePrincipalType.IsPresent
+    }
+}
+catch {
+    Write-Log "Script failed: $($_.Exception.Message)" "Error"
+
+    [pscustomobject]@{
+        Success = $false
+        Error   = $_.Exception.Message
+    }
+}
