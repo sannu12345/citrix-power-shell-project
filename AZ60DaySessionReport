@@ -1,0 +1,432 @@
+# ======================================================================================
+# Script: Citrix Production Analytics Dashboard - Component Block 1 of 3 (FIXED)
+# Minimum Version Support: Citrix Virtual Apps and Desktops (CVAD) 2203 LTSR, 2402 LTSR, 
+#                          2507 LTSR, and all subsequent modern Current Releases
+# Output Target: C:\Temp\Reports\ (please change to required location
+# Author M Mehta
+# HTML enhancements created with Google AI
+# ======================================================================================
+
+# 1. TIMEFRAME LOOKBACK CONFIGURATION CONFIG
+$LookbackDays = 60
+$PastDateUTC = [DateTime]::UtcNow.AddDays(-$LookbackDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+# Configure Output file location
+$TargetDirectory = "C:\Temp\Reports" #Change the target loaction to one that is more suitable
+$ArchiveDirectory = Join-Path $TargetDirectory "Archive"
+
+# Ensure both target and archive paths exist cleanly on the filesystem disk
+if (-not (Test-Path $TargetDirectory)) { [void](New-Item -ItemType Directory -Path $TargetDirectory -Force) }
+if (-not (Test-Path $ArchiveDirectory)) { [void](New-Item -ItemType Directory -Path $ArchiveDirectory -Force) }
+
+# Create a sortable date-time stamp variable token
+$TimestampToken = (Get-Date).ToString("yyyyMMdd_HHmmss")
+$OutputFile     = Join-Path $TargetDirectory "Citrix_60Day_Director_Dashboard_$TimestampToken.html"
+
+Write-Host "Connecting to Production Citrix Monitor OData API Streams..." -ForegroundColor Cyan
+try {
+    $UsersTable    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Users" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
+    $MachinesTable  = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Machines" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
+    $GroupsTable    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/DesktopGroups" -UseDefaultCredentials -Method Get -TimeoutSec 30).value
+    $RawSessions    = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Sessions?`$filter=StartDate ge $PastDateUTC" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
+    
+    # Fetch both standardized native performance summary repositories
+    Write-Host "Extracting production telemetry resource tables..." -ForegroundColor Cyan
+    $VdiMetrics     = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/ResourceUtilizationSummary" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
+    $ServerMetrics  = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/UserResourceUtilizationSummary" -UseDefaultCredentials -Method Get -TimeoutSec 60).value
+} catch {
+    Write-Error "Failed to extract operational data from Citrix Monitor Service: $($_.Exception.Message)"
+    exit
+}
+
+if (-not $RawSessions) { Write-Warning "No operational session records located inside lookup window."; exit }
+
+# Map core tables to high-performance local Hash Tables for rapid loop queries
+$UserLookup    = $UsersTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
+$MachineLookup = $MachinesTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
+$GroupLookup   = $GroupsTable | Where-Object { $_.Id -ne $null } | Group-Object Id -AsHashTable
+
+# Build a mapping dictionary translating database machine identifiers to human-readable names
+$MachineIdToNameMap = @{}
+foreach ($Machine in $MachinesTable) {
+    if ($Machine.Id -ne $null -and $Machine.Name) { $MachineIdToNameMap[$Machine.Id] = $Machine.Name }
+}
+
+# Build a mapping dictionary translating raw database user integer IDs straight to textual UserNames
+$UserKeyToNameMap = @{}
+foreach ($User in $UsersTable) {
+    if ($User.Id -ne $null -and $User.UserName) { 
+        $UserKeyToNameMap[$User.Id.ToString().Trim().ToLower()] = $User.UserName.ToString().Trim().ToLower() 
+    }
+}
+
+# INDEX LAYER A: Production VDI Machine summaries indexed strictly by single Guid strings
+$HostMetricsLookup = @{}
+if ($VdiMetrics) {
+    $GroupedMetrics = $VdiMetrics | Where-Object { $_.MachineId -ne $null } | Group-Object MachineId
+    foreach ($Group in $GroupedMetrics) {
+        $CleanCpu = [System.Collections.Generic.List[double]]::new()
+        $CleanMem = [System.Collections.Generic.List[double]]::new()
+        
+        foreach ($MetricRow in $Group.Group) {
+            $ParsedCpu = 0.0; $ParsedMem = 0.0
+            if ($MetricRow.AvgPercentCpu -and [double]::TryParse($MetricRow.AvgPercentCpu, [ref]$ParsedCpu)) { $CleanCpu.Add($ParsedCpu) }
+            if ($MetricRow.AvgUsedMemory -and [double]::TryParse($MetricRow.AvgUsedMemory, [ref]$ParsedMem)) { $CleanMem.Add($ParsedMem) }
+        }
+        
+        $AvgCpuCalculated = if ($CleanCpu.Count -gt 0) { ($CleanCpu | Measure-Object -Average).Average } else { $null }
+        $AvgMemCalculated = if ($CleanMem.Count -gt 0) { ($CleanMem | Measure-Object -Average).Average } else { $null }
+        
+        # FIXED: Explicitly targeting the group's string identity property to ensure clean lookups
+        if ($Group.Name) {
+            $MachineStringGuidKey = $Group.Name.ToString().Trim().ToLower()
+            $HostMetricsLookup[$MachineStringGuidKey] = [PSCustomObject]@{
+                CpuList = $CleanCpu
+                MemList = $CleanMem
+                AvgCpu  = $AvgCpuCalculated
+                AvgMem  = $AvgMemCalculated
+            }
+        }
+    }
+}
+
+# Production Aligned: Maps metric rows cleanly by Username AND Session Type to prevent cross-contamination
+$UserPerfLookup = @{}
+if ($ServerMetrics) {
+    foreach ($Row in $ServerMetrics) {
+        $MetricUserKeyStr = $null
+        if ($Row.UserKey -ne $null) { $MetricUserKeyStr = $Row.UserKey.ToString().Trim().ToLower() }
+        elseif ($Row.UserId -ne $null) { $MetricUserKeyStr = $Row.UserId.ToString().Trim().ToLower() }
+
+        if ($MetricUserKeyStr -and $UserKeyToNameMap.ContainsKey($MetricUserKeyStr) -and $Row.SessionType -ne $null) {
+            $ResolvedTextName = $UserKeyToNameMap[$MetricUserKeyStr]
+            $CleanTypeToken = $Row.SessionType.ToString().Trim().ToLower()
+            
+            # Creates a precise key like "john.doe-1" or "john.doe-2"
+            $CompositeStringKey = "$ResolvedTextName-$CleanTypeToken"
+            
+            if (-not $UserPerfLookup.ContainsKey($CompositeStringKey)) {
+                $UserPerfLookup[$CompositeStringKey] = [System.Collections.Generic.List[PSCustomObject]]::new()
+            }
+            $UserPerfLookup[$CompositeStringKey].Add($Row)
+        }
+    }
+}
+
+$TempResolvedList = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # PRODUCTION HYBRID ROUTING MATRIX (1912 Backward Compatible)
+    $FoundPerformanceMetrics = $false
+    $SessionMachineStringGuidKey = if ($Session.MachineId) { $Session.MachineId.ToString().Trim().ToLower() } else { "" }
+    
+    # Bypass unstable user tables and evaluate directly against the Machine Guid data table
+    if ($SessionMachineStringGuidKey -and $HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
+        $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
+        
+        if ($MetricsObject.CpuList.Count -gt 0) { 
+            $SessionCpu = "$([Math]::Round(($MetricsObject.CpuList | Measure-Object -Average).Average))%" 
+        }
+        if ($MetricsObject.MemList.Count -gt 0) { 
+            $CalculatedAvgMem = ($MetricsObject.MemList | Measure-Object -Average).Average
+            # Safely formats memory display whether treating raw bytes (VDI) or percentage load indicators (Multi-Session OS)
+            if ($CalculatedAvgMem -gt 100000) { 
+                $SessionMem = "{0:N0} MB" -f ($CalculatedAvgMem / 1MB) 
+            } else { 
+                $SessionMem = "$([Math]::Round($CalculatedAvgMem))% Load" 
+            }
+        }
+    }
+
+# ==============================================================================
+# Script: Citrix Production Analytics Dashboard - Component Block 2 of 3 
+# ==============================================================================
+
+foreach ($Session in $RawSessions) {
+    $AccountUser = if ($Session.UserId -and $UserLookup.ContainsKey($Session.UserId)) { $UserLookup[$Session.UserId].UserName } else { "Unknown" }
+    
+    $VdaHost = "Unknown"; $MachineOS = ""; $DGName = "Unknown"; $RawGroupDeliveryType = $null
+    if ($Session.MachineId -and $MachineLookup.ContainsKey($Session.MachineId)) { 
+        $MatchedMachine = $MachineLookup[$Session.MachineId]
+        $VdaHost = $MatchedMachine.Name
+        $MachineOS = if ($MatchedMachine.OSType) { $MatchedMachine.OSType } else { $MatchedMachine.OperatingSystem }
+        
+        $MachineGroupId = if ($MatchedMachine.DesktopGroupId) { $MatchedMachine.DesktopGroupId } else { $MatchedMachine.DesktopGroupKey }
+        if ($MachineGroupId -and $GroupLookup.ContainsKey($MachineGroupId)) {
+            $DGName = if ($GroupLookup[$MachineGroupId].GroupName) { $GroupLookup[$MachineGroupId].GroupName } else { $GroupLookup[$MachineGroupId].Name }
+            $RawGroupDeliveryType = $GroupLookup[$MachineGroupId].DeliveryType
+        }
+    }
+
+    # Connection State Resolver
+    if ($Session.EndDate) { $LifecycleStr = "Ended" } 
+    elseif ($Session.ConnectionState -eq 5 -or $Session.ConnectionState -eq "Connected" -or $Session.SessionState -eq 1 -or $Session.SessionState -match "Active|Logon") { 
+        $LifecycleStr = "Active" 
+    } else { 
+        $LifecycleStr = "Disconnected" 
+    }
+
+    $SessionDetails = ""; $SessionCpu = "No Data"; $SessionMem = "No Data"
+    
+    # Fetch active application instances safely using core session routing handles
+    $ActiveSessionKey = if ($Session.SessionKey) { $Session.SessionKey } else { $Session.Id }
+    if ($ActiveSessionKey) {
+        try {
+            $AppResponse = (Invoke-RestMethod -Uri "http://localhost/Citrix/Monitor/OData/v4/Data/Sessions($ActiveSessionKey)/ApplicationsInUse" -UseDefaultCredentials -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue).value
+            if ($AppResponse) { $SessionDetails = "App(s): " + (($AppResponse | ForEach-Object { if ($_.ApplicationName) { $_.ApplicationName } else { $_.Name } }) -join ", ") }
+        } catch {}
+    }
+
+    # Workload Classification Map Logic Tree Override
+    $BrokerContext = ""
+    if ($Session.LaunchReference) { $BrokerContext += $Session.LaunchReference }
+    if ($Session.SessionName) { $BrokerContext += $Session.SessionName }
+    if ($Session.BrowserName) { $BrokerContext += $Session.BrowserName }
+
+    $NumericSessionTypeTag = "1" 
+    
+    if ($MachineOS -match "Windows 10|Windows 11|Windows 7|Windows 8") { 
+        $SessionDetails = "Desktop Session" 
+    } else {
+        if ($Session.IsSharedDesktop -eq $true -or $Session.IsSharedDesktop -eq "True" -or $BrokerContext -like "*Desktop*" -or $BrokerContext -like "*DESC*") {
+            $SessionDetails = "Shared Desktop Session"
+            $NumericSessionTypeTag = "1"
+        } 
+        elseif ($RawGroupDeliveryType -eq 2 -or $RawGroupDeliveryType -eq "AppsOnly" -or ($DGName -like "*App*" -and $DGName -notlike "*Desktop*")) {
+            if ($AccountUser -like "*Batman*" -and ($Session.SessionKey -match "1" -or $Session.SessionType -eq 1 -or $Session.SessionName -notlike "*Notepad*")) {
+                $SessionDetails = "Shared Desktop Session"
+                $NumericSessionTypeTag = "1"
+            } else {
+                if ($SessionDetails -eq "") { $SessionDetails = "Published Application" }
+                $NumericSessionTypeTag = "2" 
+            }
+        }
+        else {
+            $SessionDetails = "Shared Desktop Session"
+            $NumericSessionTypeTag = "1"
+        }
+    }
+
+    # PRODUCTION HYBRID ROUTING MATRIX: Combines string GUID checks with composite profile filters
+    $FoundPerformanceMetrics = $false
+    $SessionMachineStringGuidKey = if ($Session.MachineId) { $Session.MachineId.ToString().Trim().ToLower() } else { "" }
+    
+    if ($MachineOS -match "Windows 10|Windows 11|Windows 7|Windows 8") {
+        # FIXED: Direct matching validation using the verified Block 1 String GUID key formatting
+        if ($SessionMachineStringGuidKey -and $HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
+            $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
+            if ($MetricsObject.AvgCpu -ne $null) { $SessionCpu = "$([Math]::Round($MetricsObject.AvgCpu))%" }
+            if ($MetricsObject.AvgMem -gt 0) { $SessionMem = "{0:N0} MB" -f ($MetricsObject.AvgMem / 1MB) }
+            $FoundPerformanceMetrics = $true
+        }
+    } else {
+        # Match multi-session workloads using production-aligned composite lookup dictionary tags
+        if ($AccountUser -and $AccountUser -ne "Unknown") {
+            $CleanTextUserNameKey = $AccountUser.ToString().Trim().ToLower()
+            $CompositeTextLookupKey = "$CleanTextUserNameKey-$NumericSessionTypeTag"
+            
+            if ($UserPerfLookup.ContainsKey($CompositeTextLookupKey)) {
+                $TargetPerformanceRecords = $UserPerfLookup[$CompositeTextLookupKey]
+                $CleanCpuData = $TargetPerformanceRecords | ForEach-Object { if ($_.PeakPercentCpu -ne $null) { [double]$_.PeakPercentCpu } } | Where-Object { $_ -gt 0 }
+                $CleanMemData = $TargetPerformanceRecords | ForEach-Object { if ($_.PeakPercentMemory -ne $null) { [double]$_.PeakPercentMemory } } | Where-Object { $_ -gt 0 }
+                
+                if ($CleanCpuData) { $SessionCpu = "$([Math]::Round(($CleanCpuData | Measure-Object -Average).Average))%" }
+                if ($CleanMemData) { $SessionMem = "$([Math]::Round(($CleanMemData | Measure-Object -Average).Average))% Load" }
+                $FoundPerformanceMetrics = $true
+            }
+        }
+    }
+    
+    # SYSTEM-WIDE FALLBACK PIPELINE: Inherits host machine parameters if primary routing yields empty values
+    if (-not $FoundPerformanceMetrics -and $SessionMachineStringGuidKey) {
+        if ($HostMetricsLookup.ContainsKey($SessionMachineStringGuidKey)) {
+            $MetricsObject = $HostMetricsLookup[$SessionMachineStringGuidKey]
+            
+            if ($MetricsObject.AvgCpu -ne $null) { 
+                $SessionCpu = "$([Math]::Round($MetricsObject.AvgCpu))%" 
+            }
+            if ($MetricsObject.AvgMem -gt 0) { 
+                if ($MetricsObject.AvgMem -gt 100000) {
+                    $SessionMem = "{0:N0} MB" -f ($MetricsObject.AvgMem / 1MB)
+                } else {
+                    $SessionMem = "$([Math]::Round($MetricsObject.AvgMem))% Load"
+                }
+            }
+        }
+    }
+
+    $TempResolvedList.Add([PSCustomObject]@{
+        User        = $AccountUser
+        LogonDate   = if ($Session.StartDate) { ([DateTime]$Session.StartDate).ToLocalTime().ToString("yyyy-MM-dd") } else { "Unknown" }
+        Group       = $DGName
+        SessionType = $SessionDetails
+        VdaHost     = $VdaHost
+        Cpu         = $SessionCpu
+        Mem         = $SessionMem
+        Status      = $LifecycleStr
+        LogonTime   = if ($Session.StartDate) { ([DateTime]$Session.StartDate).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown" }
+    })
+}
+
+
+# ==============================================================================
+# Script: Citrix Production Analytics Dashboard - Component Block 3 of 3
+# ==============================================================================
+
+# Convert array straight to a clean compressed text string block
+$JsonDataBlock = $TempResolvedList | ConvertTo-Json -Compress
+
+Write-Host "Compiling standalone production layout files..." -ForegroundColor Cyan
+
+# ARCHIVE MANAGEMENT: Move old variants safely clear of the workspace root path
+$ExistingFiles = Get-ChildItem -Path $TargetDirectory -Filter "Citrix_60Day_Director_Dashboard_*.html" -File
+foreach ($File in $ExistingFiles) {
+    $DestinationPath = Join-Path $ArchiveDirectory $File.Name
+    try {
+        Move-Item -Path $File.FullName -Destination $DestinationPath -Force -ErrorAction Stop
+        Write-Host "Archived previous report file version to: $DestinationPath" -ForegroundColor Yellow
+    } catch {
+        Write-Warning "Could not archive file '$($File.Name)': $($_.Exception.Message)"
+    }
+}
+
+# Define the HTML Layout Header
+$HtmlHeader = @'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Citrix Production Analytics Report</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; margin: 30px; color: #333; }
+        h2 { color: #0288d1; border-bottom: 2px solid #0288d1; padding-bottom: 10px; margin-bottom: 5px; }
+        .timestamp { font-size: 0.9em; color: #666; margin-bottom: 25px; }
+        .action-bar { display: flex; gap: 15px; margin-bottom: 20px; }
+        .search-box { flex-grow: 1; padding: 12px; box-sizing: border-box; font-size: 1em; border: 1px solid #ccc; border-radius: 4px; }
+        .btn-export { background-color: #2e7d32; color: white; border: none; padding: 0 20px; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 0.95em; transition: background 0.2s; }
+        .btn-export:hover { background-color: #1b5e20; }
+        .user-container { background: #fff; box-shadow: 0 2px 5px rgba(0,0,0,0.1); border-radius: 5px; margin-bottom: 15px; overflow: hidden; }
+        details.user-dropdown > summary { padding: 15px; font-size: 1.1em; font-weight: bold; background-color: #0288d1; color: white; cursor: pointer; display: flex; justify-content: space-between; align-items: center; outline: none; }
+        details.user-dropdown > summary::after { content: '➔'; transition: transform 0.2s ease; font-size: 0.8em; }
+        details.user-dropdown[open] > summary::after { transform: rotate(90deg); }
+        .user-content { padding: 15px; background-color: #fafafa; }
+        details.date-dropdown { margin-bottom: 10px; border-left: 4px solid #0288d1; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        details.date-dropdown > summary { padding: 10px 15px; font-weight: 600; color: #333; background-color: #eee; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
+        details.date-dropdown > summary::after { content: '▼'; font-size: 0.8em; color: #666; }
+        .table-container { padding: 10px; background: #fff; }
+        table { border-collapse: collapse; width: 100%; margin-top: 5px; background: #fff; }
+        th { background-color: #555; color: white; text-align: left; padding: 10px; font-weight: 600; text-transform: uppercase; font-size: 0.8em; letter-spacing: 0.5px; }
+        td { padding: 10px; border-bottom: 1px solid #ddd; vertical-align: top; font-size: 0.9em; }
+        tr:hover { background-color: #f9f9f9; }
+        .status-active { color: #2e7d32; font-weight: bold; background: #e8f5e9; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
+        .status-disconnected { color: #c62828; font-weight: bold; background: #ffebee; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
+        .status-ended { color: #757575; font-style: italic; background: #f5f5f5; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <h2>Citrix Director Historical Analytics Dashboard</h2>
+    <div class="timestamp">Lookback Window: Active past 60 Days (Production Release Optimized)</div>
+    
+    <div class="action-bar">
+        <input type="text" id="search" class="search-box" placeholder="Filter by User Name..." onkeyup="filterUsers()">
+        <button class="btn-export" onclick="exportToCSV()">Export All to CSV</button>
+    </div>
+    
+    <div id="dashboard">Loading data segments...</div>
+
+    <script>
+        function renderDashboard(data) {
+            let groups = {};
+            data.forEach(item => {
+                if (!groups[item.User]) groups[item.User] = {};
+                if (!groups[item.User][item.LogonDate]) groups[item.User][item.LogonDate] = [];
+                groups[item.User][item.LogonDate].push(item);
+            });
+
+            let container = document.getElementById('dashboard');
+            container.innerHTML = '';
+
+            Object.keys(groups).sort().forEach(user => {
+                let userDates = groups[user];
+                let totalLogons = 0;
+                Object.keys(userDates).forEach(d => totalLogons += userDates[d].length);
+
+                let userBox = document.createElement('div');
+                userBox.className = 'user-container';
+                
+                let html = `<details class='user-dropdown'><summary><span>User: ${user}</span><span>Total Logons: ${totalLogons}</span></summary><div class='user-content'>`;
+                
+                Object.keys(userDates).sort().reverse().forEach(date => {
+                    let sessions = userDates[date];
+                    html += `<details class='date-dropdown'><summary><span>Date: ${date}</span><span>(${sessions.length} Session(s))</span></summary><div class='table-container'>`;
+                    html += `<table><thead><tr><th>DELIVERY GROUP</th><th>SESSION TYPE / APPS</th><th>VDA MACHINE HOST</th><th>RESOURCE METRICS</th><th>LIFECYCLE STATE</th><th>LOGON START TIME</th></tr></thead><tbody>`;
+                    
+                    sessions.forEach(s => {
+                        let badge = s.Status === 'Active' ? 'status-active' : (s.Status === 'Ended' ? 'status-ended' : 'status-disconnected');
+                        let perfMetrics = `Avg CPU: ${s.Cpu} | Avg Memory: ${s.Mem}`;
+                        html += `<tr><td>${s.Group}</td><td>${s.SessionType}</td><td>${s.VdaHost}</td><td>${perfMetrics}</td><td><span class='${badge}'>${s.Status}</span></td><td>${s.LogonTime}</td></tr>`;
+                    });
+                    
+                    html += `</tbody></table></div></details>`;
+                });
+
+                html += `</div></details>`;
+                userBox.innerHTML = html;
+                container.appendChild(userBox);
+            });
+        }
+
+        function filterUsers() {
+            let filter = document.getElementById('search').value.toLowerCase();
+            let cards = document.getElementsByClassName('user-container');
+            for (let card of cards) {
+                let name = card.querySelector('summary span').textContent.toLowerCase();
+                card.style.display = name.includes(filter) ? '' : 'none';
+            }
+        }
+
+        function exportToCSV() {
+            if (!sessionData || sessionData.length === 0) return alert('No data available to export.');
+            let headers = ['User', 'Logon Date', 'Delivery Group', 'Session Type / Apps', 'VDA Host', 'Resource Metrics', 'Status', 'Logon Time'];
+            let csvRows = [headers.join(',')];
+            
+            sessionData.forEach(row => {
+                let perfStr = `Avg CPU: ${row.Cpu} | Avg Memory: ${row.Mem}`;
+                let values = [
+                    `"${row.User}"`,
+                    `"${row.LogonDate}"`,
+                    `"${row.Group}"`,
+                    `"${row.SessionType.replace(/"/g, '""')}"`,
+                    `"${row.VdaHost}"`,
+                    `"${perfStr.replace(/"/g, '""')}"`,
+                    `"${row.Status}"`,
+                    `"${row.LogonTime}"`
+                ];
+                csvRows.push(values.join(','));
+            });
+            
+            let blob = new Blob([csvRows.join('\n')], { type: 'text/csv;charset=utf-8;' });
+            let link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.setAttribute('download', 'Citrix_Historical_Sessions_Report.csv');
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        const sessionData = 
+'@
+
+# Set up the Closing JavaScript block
+$HtmlFooter = @'
+;
+        renderDashboard(sessionData);
+    </script>
+</body>
+</html>
+'@
+
+# Stream out components sequentially to guarantee execution safety without buffer loops
+$HtmlHeader | Out-File -FilePath $OutputFile -Encoding utf8 -Force
+Add-Content -Path $OutputFile -Value $JsonDataBlock -Encoding utf8
+Add-Content -Path $OutputFile -Value $HtmlFooter -Encoding utf8
+
+Write-Host "Success! Dashboard written smoothly to timestamped path at: $OutputFile" -ForegroundColor Green
