@@ -1,0 +1,16 @@
+Connect-VIServer domain name
+
+$VMlist= Get-Content "VMlist.txt"
+
+foreach($vm in $VMlist)
+{
+	$ConfirmPreference = 'None'
+#Get-VM -Name $vm | Get-CDDrive| Set-CDDrive -Connected $true -IsoPath '[SESKSVM15_ISO Respository] Citrix 7.12-PROD ISO.iso' -StartConnected $true -Confirm:$false
+
+#Get-VM -Name $vm | Get-CDDrive| Set-CDDrive -Connected $true -IsoPath '[SESKSVM15_ISO Respository] ISO Repository/PVS/citrix-pvs-1912LTSR/citrix-pvs-1912ltsr-bdm.iso' -StartConnected $true -Confirm:$false
+
+#to get list of iso connected 
+#Get-vm -Name $vm | where { $_ | get-cddrive | where { $_.ConnectionState.Connected -eq "true" -and $_.ISOPath -like "*.ISO*"} } | select Name, @{Name=".ISO Path";Expression={(Get-CDDrive $_).isopath }}
+
+#Restart-VM $vm
+}
